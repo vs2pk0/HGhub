@@ -9,12 +9,16 @@ import type {
 export const APP_VERSION = __APP_VERSION__;
 
 const ua = navigator.userAgent;
-export const isAndroid = /Android/i.test(ua);
 /** iPhone 的 UA 也带「like Mac OS X」，必须先于 macOS 判断；iPadOS 默认伪装成 Mac，用触点数区分。 */
-export const isIos = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+export const isIos =
+  /iPhone|iPad|iPod/i.test(ua) ||
+  (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1) ||
+  (typeof navigator.platform === "string" && navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+export const isAndroid = /Android/i.test(ua);
 export const isMacos = !isIos && /Macintosh|Mac OS X/i.test(ua);
-export const platform: "android" | "ios" | "windows" | "macos" =
-  isAndroid ? "android" : isIos ? "ios" : isMacos ? "macos" : "windows";
+export const isLinux = !isAndroid && !isIos && /Linux/i.test(ua);
+export const platform: "android" | "ios" | "windows" | "macos" | "linux" =
+  isAndroid ? "android" : isIos ? "ios" : isMacos ? "macos" : isLinux ? "linux" : "windows";
 /** 移动端（安卓 / iOS）共用触屏界面 */
 export const isMobile = isAndroid || isIos;
 
@@ -22,7 +26,7 @@ export const isMobile = isAndroid || isIos;
  *  Windows / Android → `http://<scheme>.localhost`
  *  macOS / iOS / Linux → `<scheme>://localhost`
  *  Rust 侧 `src-tauri/src/lib.rs` 里改写 m3u8 用的 scheme 必须与此一致。 */
-export const LOCAL = isMacos || isIos ? "hg://localhost" : "http://hg.localhost";
+export const LOCAL = isMacos || isIos || isLinux ? "hg://localhost" : "http://hg.localhost";
 
 /** src 是否已是本地协议地址（避免在详情页把代理地址再包一层） */
 export const isLocalMedia = (src: string) => src.startsWith(`${LOCAL}/`);
@@ -65,6 +69,8 @@ export const api = {
       strict_security?: boolean;
       cli_relaxed?: boolean;
     }>("app_boot"),
+  securityCidrsGet: () => call<string>("security_cidrs_get"),
+  securityCidrsSet: (cidrs: string) => call<string>("security_cidrs_set", { cidrs }),
   securitySet: (strict: boolean) => call<boolean>("security_set", { strict }),
   login: (username: string, password: string) =>
     call<{ user: User }>("api_login", { username, password }),
@@ -93,7 +99,18 @@ export const api = {
   commentSend: (id: number, ep: number, text: string, replyId?: number) =>
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
-  clearCache: () => invoke<void>("cache_clear"),
+  clearCache: async () => { try { await invoke<void>("cache_clear"); } finally { window.dispatchEvent(new Event("playback-cache-change")); } },
+  playbackCacheStatus: () => call<{ max_mib: number; bytes: number; revision: number }>("playback_cache_status"),
+  playbackCacheSet: async (maxMib: number) => { try { await call<void>("playback_cache_set", { maxMib }); } finally { window.dispatchEvent(new Event("playback-cache-change")); } },
+  playbackCacheContains: (urls: string[]) => call<boolean[]>("playback_cache_contains", { urls }),
+  playbackCachePrefetch: (url: string, protectedUrls: string[], sessionId: string, range?: { start: number; end: number }, validator?: string, focus?: number) => call<boolean>("playback_cache_prefetch", { url, range: range ?? null, validator: validator ?? null, focus: focus ?? null, protectedUrls, sessionId }),
+  playbackCacheObserved: (urls: string[]) => call<number | null>("playback_cache_observed", { urls }),
+  playbackCacheProbe: (url: string, sessionId: string) => call<{ total: number; tag: string }>("playback_cache_probe", { url, sessionId }),
+  playbackCacheCursor: (url: string) => call<number>("playback_cache_cursor", { url }),
+  playbackCachePending: (url: string) => call<{ start: number; end: number }[]>("playback_cache_pending", { url }),
+  playbackCacheReady: (sessionId: string, ready: boolean) => call<void>("playback_cache_ready", { sessionId, ready }),
+  playbackCacheStart: (sessionId: string) => call<void>("playback_cache_start", { sessionId }),
+  playbackCacheStop: (sessionId: string) => call<void>("playback_cache_stop", { sessionId }),
   netDiag: () => invoke<Record<string, unknown>>("net_diag"),
   postLike: (id: number, on: boolean) => invoke<unknown>("api_post_like", { id, on }),
   postCollect: (id: number, on: boolean) => invoke<unknown>("api_post_collect", { id, on }),
@@ -209,10 +226,11 @@ export const dur = (s?: number | string) => {
 
 /** 非 m3u8 媒体（mp4 等）走 /seg 原样透传 */
 export function directMedia(url: string): string {
-  return `${LOCAL}/seg?u=${encodeURIComponent(url)}`;
+  return `${LOCAL}/seg?u=${encodeURIComponent(url)}&direct=1`;
 }
 
-/** 按扩展名选择代理方式：m3u8 → 播放列表改写；其它 → 原样透传 */
+/** 已知直链文件走字节范围代理；扩展名未知时保持 HLS 播放路径。 */
 export function mediaUrl(url: string): string {
-  return /\.m3u8(\?|$)/i.test(url) ? playlist(url) : directMedia(url);
+  const path = url.split(/[?#]/, 1)[0];
+  return /\.(?:mp4|m4v|webm|mov|ogv)$/i.test(path) ? directMedia(url) : playlist(url);
 }

@@ -1,0 +1,112 @@
+name: Merge checks
+
+on:
+  pull_request:
+  push:
+    branches: [main, security-audit]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop build and local regressions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install Tauri and media test dependencies
+        timeout-minutes: 10
+        run: |
+          # Also bound APT connections made later by Playwright's --with-deps.
+          sudo tee /etc/apt/apt.conf.d/99-hghub-ci-network >/dev/null <<'APT'
+          Acquire::Retries "2";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          APT
+
+          # Ubuntu 26.04's pkgconf provides the pkg-config command.
+          ci_packages=(libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev libssl-dev build-essential pkgconf ffmpeg)
+          ci_missing=()
+          for ci_package in "${ci_packages[@]}"; do
+            if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$ci_package" 2>/dev/null)" != installed ]]; then
+              ci_missing+=("$ci_package")
+            fi
+          done
+          if (( ${#ci_missing[@]} )); then
+            printf 'Installing missing build dependencies: %s\n' "${ci_missing[*]}"
+            time sudo apt-get update
+            time sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${ci_missing[@]}"
+          else
+            echo 'All required Tauri and media build dependencies are already installed.'
+          fi
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Run Rust loopback integrations without upstream services
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib local_server -- --ignored --test-threads=1
+      - run: pnpm test:cache
+      - run: pnpm exec playwright-core install --with-deps chromium
+      - run: pnpm test:security
+      - run: pnpm test:api-loading
+      - run: pnpm test:playback
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: local-regression-diagnostics
+          path: test-results/
+          retention-days: 7
+
+  android:
+    name: Native Android build and security tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify Gradle wrapper before executing it
+        run: echo '2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046  native/android/gradle/wrapper/gradle-wrapper.jar' | sha256sum --check
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          # Keep the package list explicit; the retired "tools" package must not be installed.
+          packages: platform-tools
+      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Build without release signing credentials and run tests
+        working-directory: native/android
+        run: sh ./gradlew :app:assembleDebug :app:testDebugUnitTest --no-daemon
+
+  ios:
+    name: Native iOS build and security tests
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - run: python3 native/ios/tests/test_proxy_disconnect.py
+      - run: python3 native/ios/tests/test_security.py
+      - name: Compile iOS simulator app without signing credentials
+        working-directory: native/ios
+        run: |
+          xcodebuild -project HGhub.xcodeproj -scheme HGhub -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build

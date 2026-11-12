@@ -5,12 +5,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
+data class SessionContext(val origin: String, val token: String, val revision: Long)
+
 class AppStore(ctx: Context) {
     private val prefs = ctx.getSharedPreferences("hghub_native_v1", Context.MODE_PRIVATE)
+    private val vault = TokenVault(ctx)
 
     var base by mutableStateOf(prefs.getString("base", DEFAULT_BASE) ?: DEFAULT_BASE)
         private set
-    var token by mutableStateOf(prefs.getString("token", "") ?: "")
+    var token by mutableStateOf(vault.read(base))
         private set
     var account by mutableStateOf(accountFrom(prefs.getString("user", null)))
         private set
@@ -39,12 +42,25 @@ class AppStore(ctx: Context) {
     var searches by mutableStateOf(stringsFrom(prefs.getString("searches", null)))
         private set
     var toast by mutableStateOf<String?>(null)
+    private var sessionOrigin = prefs.getString("token_origin", "").orEmpty()
+    private var sessionRevision = 0L
+
+    // Called on the main dispatcher so origin, token and revision are one snapshot.
+    fun sessionContext() = SessionContext(base, token.takeIf { sessionOrigin == base && trustedLine }.orEmpty(), sessionRevision)
+    fun isCurrent(context: SessionContext) = context.origin == base && context.revision == sessionRevision
 
     val loggedIn: Boolean get() = token.isNotBlank()
     val trustedLine: Boolean
         get() = base == "https://huangguoai.com" || base == "https://huangguoai.ai"
 
     init {
+        prefs.edit().remove("token").apply() // Remove the previous plaintext format.
+        if (sessionOrigin != base || !trustedLine || token.isEmpty()) {
+            token = ""
+            account = null
+            prefs.edit().remove("token").remove("user").remove("token_origin").apply()
+            vault.clear()
+        }
         if (muteOnStartup && !muted) {
             muted = true
             prefs.edit().putBoolean("muted", true).apply()
@@ -79,24 +95,36 @@ class AppStore(ctx: Context) {
     }
 
     fun setLine(url: String) {
-        val next = url.trim().trimEnd('/')
+        val next = runCatching { checkedOrigin(url.trim()) }.getOrNull() ?: return
         if (next == base) return
+        sessionRevision++
+        sessionOrigin = ""
+        vault.clear()
         base = next
         token = ""
         account = null
-        prefs.edit().putString("base", next).remove("token").remove("user").apply()
+        prefs.edit().putString("base", next).remove("token").remove("user").remove("token_origin").apply()
     }
 
-    fun setSession(token: String, user: Account) {
+    fun setSession(token: String, user: Account, context: SessionContext): Boolean {
+        if (!isCurrent(context) || !trustedLine) return false
+        vault.write(token, context.origin)
+        sessionRevision++
+        sessionOrigin = context.origin
         this.token = token
         account = user
-        prefs.edit().putString("token", token).putString("user", user.toJson().toString()).apply()
+        prefs.edit().putString("token_origin", sessionOrigin).putString("user", user.toJson().toString()).apply()
+        return true
     }
 
-    fun logout() {
+    fun logout(context: SessionContext? = null) {
+        if (context != null && !isCurrent(context)) return
+        sessionRevision++
+        sessionOrigin = ""
+        vault.clear()
         token = ""
         account = null
-        prefs.edit().remove("token").remove("user").apply()
+        prefs.edit().remove("token").remove("user").remove("token_origin").apply()
     }
 
     fun isFav(id: Int) = id in favs

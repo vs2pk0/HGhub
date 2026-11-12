@@ -77,6 +77,8 @@ pnpm test:playback
 
 命令自动生成 90 秒 HLS 样本、启动仅监听本机随机端口的 Vite/媒体服务、操作无头浏览器，并在结束后关闭服务、浏览器及删除临时媒体。不需要显示器、桌面会话、账号或播放直链。测试中的外部网络请求会被拦截并导致失败。
 
+默认包含真实 Rust 缓存集成测试，需要 [开发环境](../README.md#本地开发) 所述的 Rust/Tauri 依赖。测试以 `cargo test --offline --locked` 启动仅用于测试的本地 HTTP 桥，首次运行前需准备好 Cargo 依赖；`mp4-cache` 还会把 HLS 样本封装成 MP4。仅检查前端时，可用 `--scenarios` 指定下面除 `cache-resume`、`mp4-cache` 之外的场景。
+
 每次运行保存到新的 `test-results/playback/<UTC时间>/` 目录，包含：
 
 - `report.json`：平台、浏览器版本、每个检查的结果、点击耗时、拖动请求数及失败原因。
@@ -87,7 +89,7 @@ pnpm test:playback
 
 可用 `pnpm exec playwright-core show-trace <trace.zip路径>` 打开追踪。输出目录已经加入 gitignore；文件保存在执行命令的服务器，不会自动上传。
 
-默认检查五个场景：
+默认检查 16 个场景：
 
 | 场景 | 检查内容 |
 | --- | --- |
@@ -96,6 +98,15 @@ pnpm test:playback
 | `stall` | 人为停止 HLS 缓冲后点击未缓冲位置，检查 8 秒超时日志以及恢复缓冲后的首帧；属于故障注入 |
 | `lifecycle` | 两个播放器延迟清单后失活、后台禁止自动播放和分片加载、重新激活后恢复、手动暂停状态保留，以及视频延迟挂载时保持失活 |
 | `mms` | 两个播放器在两种 API 同时存在时优先使用标准 MSE；在模拟 MMS-only 环境中，endstreaming 停止缓冲后点击未缓冲位置，即使没有 startstreaming 事件也能自动恢复并输出首帧 |
+| `subtitles`、`subtitles-legacy`、`subtitles-hls` | 字幕偏好持久化、换源、迟到轨道，以及真实 HLS 字幕显示与切换 |
+| `resume` | 分类、频道、收藏、历史、搜索等入口恢复上次集数与位置，显式选集及失败重试 |
+| `progress` | 定时和生命周期保存、超过 80 条历史后的进度保留、旧写入拒绝、清除及片尾重播 |
+| `replay` | 最后一集结束后在同一播放器拖回重播，保存新位置、再次识别片尾并重新进入续播 |
+| `interrupted` | 恢复进度期间用户主动跳转，连续切集后旧清单迟到，旧任务不得覆盖最新选择 |
+| `autonext` | 连播成功前保留旧记录，新集使用自己的时长和位置，并能重新进入续播 |
+| `storage` | 13 个存储和进度边界用例，包括损坏/旧记录、读写被拒绝、空间不足与恢复、旧回调、重播及片尾 3 秒边界 |
+| `cache-resume` | 实际 Rust 磁盘缓存命中、续播后在已有缓存边缘前继续预取、重新进入复用目标分片 |
+| `mp4-cache` | 原生 video 通过真实 Rust Range 代理解码 MP4、续播、补齐固定分块、避免重复字节下载、跳转与重新进入复用缓存 |
 
 任何检查失败，命令退出码为 1，仍保留日志和报告。不要把日志采集通过理解成所有播放问题已修复。只运行诊断回归可以选择：
 
@@ -109,4 +120,4 @@ pnpm test:playback --scenarios seek,legacy,stall
 
 仓库附带手动触发的 GitHub Actions 工作流 **Playback diagnostics**。它会在检查失败时仍上传日志、截图与追踪，保留 7 天；不会随推送自动运行。
 
-**覆盖边界：** 这些测试使用真实 React 控件、video、hls.js 与本地 HTTP 分片，但业务 API 和 Tauri 日志 IPC 使用替身。它们不执行真实 Rust 媒体代理，不验证真实 CDN、代理/TUN、Tauri 的 CSP/Origin/DNS 策略，也不能证明 macOS 27 的 ManagedMediaSource 问题已复现或修复。Rust 日志持久化/轮转/脱敏仍由本地 Rust 回归检查；macOS 特有问题使用实机 `playback.log` 确认。
+**覆盖边界：** 播放场景使用真实 React 控件、video、hls.js 与本地 HTTP 媒体，业务 API 和 Tauri 日志 IPC 使用替身；`storage` 使用可控媒体状态检查实际 store 和进度 hook。`cache-resume`、`mp4-cache` 通过测试 HTTP 桥调用真实 Rust 媒体代理和缓存实现，其余场景使用媒体代理替身。它们不验证原生 Tauri IPC/WebView、真实 CDN、代理/TUN 或原生应用的 CSP/Origin/DNS 策略，也不能证明 macOS 27 的 ManagedMediaSource 问题已复现或修复。Rust 日志持久化/轮转/脱敏仍由本地 Rust 回归检查；macOS 特有问题使用实机 `playback.log` 确认。

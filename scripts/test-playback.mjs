@@ -1,4 +1,4 @@
-// Local-only headless playback checks. No upstream APIs, credentials or Tauri IPC are used.
+// Local-only headless playback checks. Integrated cache cases call Rust through a test-only HTTP bridge.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
@@ -10,46 +10,77 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium } from "playwright-core";
 import { createServer as createViteServer } from "vite";
+import { checks as regressionChecks } from "./playback-regressions.mjs";
+import { startBackend } from "./playback-backend.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: `seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,progress,${Object.keys(regressionChecks).join(',')}` }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms]");
+  console.log(`pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,progress,${Object.keys(regressionChecks).join(',')}]`);
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls", "progress", ...Object.keys(regressionChecks)].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
 const jsonl = (file, entry) => appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
 const report = { started: new Date().toISOString(), platform: process.platform, browser: "chromium", transport: "browser fixture; not Tauri/WKWebView", output, cases: [] };
-let temporaryMedia, vite, media, browser;
+let temporaryMedia, vite, media, browser, backend;
+const mediaRequests = [];
 let nextRequest = 0;
 const requests = new Set();
 
-async function serveMedia(dir) {
+async function serveMedia(dir, mp4) {
   const manifest = await readFile(join(dir, "list.m3u8"), "utf8");
   assert(manifest.startsWith("#EXTM3U") && manifest.includes("#EXT-X-ENDLIST"), "Expected a local VOD HLS fixture");
   const server = createHttpServer(async (req, res) => {
     const started = performance.now(), request = ++nextRequest;
     const url = new URL(req.url, "http://localhost");
     let status = 200, bytes = 0, fragment;
-    res.on("close", () => jsonl(join(output, "media-server.jsonl"), { request, route: url.pathname, fragment, status, bytes, elapsed_ms: Math.round(performance.now() - started), aborted: !res.writableFinished }));
+    res.on("close", () => {
+      const record = { request, route: url.pathname, resource: `${url.pathname}${url.search}`, fragment, range: req.headers.range, status, bytes, elapsed_ms: Math.round(performance.now() - started), aborted: !res.writableFinished };
+      mediaRequests.push(record); jsonl(join(output, "media-server.jsonl"), record);
+    });
     try {
       let body, kind;
-      if (url.pathname === "/hls") {
-        body = Buffer.from(manifest.split("\n").map(line => !line || line.startsWith("#") ? line :
-          `http://hg.localhost/seg?u=${encodeURIComponent(`https://media.fixture.invalid/${line.trim()}`)}`).join("\n"));
+      const target = new URL(url.searchParams.get("u") || "https://media.fixture.invalid/list.m3u8");
+      const proxied = file => `http://hg.localhost/seg?u=${encodeURIComponent(`https://media.fixture.invalid/${file}`)}`;
+      const selected = target.searchParams.has('short') ? manifest.split(/(?=#EXTINF:)/).slice(0, 16).join('') + '#EXT-X-ENDLIST\n' : manifest;
+      const rewritten = () => Buffer.from(selected.split("\n").map(line => !line || line.startsWith("#") ? line : proxied(line.trim())).join("\n"));
+      if (url.pathname === '/vod/list.m3u8') {
+        body = Buffer.from(manifest); kind = 'application/vnd.apple.mpegurl';
+      } else if (/^\/vod\/seg\d+\.ts$/.test(url.pathname)) {
+        fragment = basename(url.pathname); body = await readFile(join(dir, fragment)); kind = 'video/mp2t';
+        await new Promise(resolve => setTimeout(resolve, 15));
+      } else if (url.pathname === '/vod/video.mp4' && mp4) {
+        const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
+        const start = range ? Number(range[1]) : 0, end = range?.[2] ? Math.min(Number(range[2]), mp4.length - 1) : mp4.length - 1;
+        if (start > end || start >= mp4.length) { res.writeHead(416); res.end(); return; }
+        body = mp4.subarray(start, end + 1); kind = 'video/mp4'; status = range ? 206 : 200;
+        res.setHeader('ETag', '"fixture-v1"'); res.setHeader('Accept-Ranges', 'bytes');
+        if (range) res.setHeader('Content-Range', `bytes ${start}-${end}/${mp4.length}`);
+        await new Promise(resolve => setTimeout(resolve, 8));
+      } else if (url.pathname === "/hls") {
+        body = target.pathname.endsWith("master.m3u8")
+          ? Buffer.from(`#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="text",NAME="Chinese",LANGUAGE="zh",DEFAULT=YES,AUTOSELECT=YES,URI="${proxied('subs.m3u8')}"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,SUBTITLES="text"\n${proxied('list.m3u8')}\n`)
+          : rewritten();
         kind = "application/vnd.apple.mpegurl";
       } else if (url.pathname === "/seg") {
-        fragment = basename(new URL(url.searchParams.get("u")).pathname);
-        assert(/^seg\d+\.ts$/.test(fragment), "Unexpected fixture segment");
-        await new Promise(done => setTimeout(done, 120));
-        body = await readFile(join(dir, fragment)); kind = "video/mp2t";
+        fragment = basename(target.pathname);
+        if (fragment === "list.m3u8") { body = rewritten(); kind = "application/vnd.apple.mpegurl"; }
+        else if (fragment === "subs.m3u8") {
+          body = Buffer.from(`#EXTM3U\n#EXT-X-TARGETDURATION:90\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:90,\n${proxied('text.vtt')}\n#EXT-X-ENDLIST\n`); kind = "application/vnd.apple.mpegurl";
+        } else if (fragment === "text.vtt") {
+          body = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:01:30.000\nReal HLS subtitles\n"); kind = "text/vtt";
+        } else {
+          assert(/^seg\d+\.ts$/.test(fragment), "Unexpected fixture segment");
+          await new Promise(done => setTimeout(done, 120));
+          body = await readFile(join(dir, fragment)); kind = "video/mp2t";
+        }
       } else { status = 404; body = Buffer.from("not found"); kind = "text/plain"; }
       bytes = body.length;
       res.writeHead(status, { "Content-Type": kind, "Content-Length": bytes, "Access-Control-Allow-Origin": "*" });
@@ -78,15 +109,84 @@ async function loadPlayer(page, legacy = false, extra = "") {
   await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&proxy=${encodeURIComponent(report.media)}${legacy ? "&legacy=1" : ""}${extra}`);
   await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
 }
-async function seekChecks(page, legacy) {
+async function subtitleChecks(page, legacy) {
   await loadPlayer(page, legacy);
+  const button = page.getByRole("button", { name: "字幕", exact: true });
+  assert.equal(await button.getAttribute("aria-pressed"), "true", "Fresh preferences enable subtitles");
+  const addTrack = () => page.evaluate(() => {
+    const video = document.querySelector("video");
+    const track = video.addTextTrack("subtitles", "Fixture captions", "zh");
+    track.addCue(new VTTCue(0, 90, "Subtitle fixture"));
+    window.playerSeekFixture.caption = track;
+  });
+  const mode = expected => page.waitForFunction(expected => window.playerSeekFixture.caption?.mode === expected, expected);
+  const toggle = async () => { await page.mouse.move(650, 450); await button.click(); };
+  await addTrack(); await mode("showing");
+  await toggle(); await mode("hidden");
+  assert.equal(JSON.parse(await page.evaluate(() => localStorage.getItem("hghub_app_v1"))).subtitlesEnabled, false);
+  await page.evaluate(() => window.playerSeekFixture.nextSource());
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "false");
+  await addTrack();
+  await page.evaluate(() => { window.playerSeekFixture.caption.mode = "showing"; });
+  await mode("hidden");
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "false", "Reload retains hidden preference");
+  await addTrack(); await toggle(); await mode("showing");
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "true", "Reload retains visible preference");
+  await addTrack(); await mode("showing");
+  const native = await page.evaluate(async () => {
+    const { attachSubtitles } = await import('/src/subtitles.ts');
+    const video = document.createElement("video");
+    let enabled = false;
+    const metadata = video.addTextTrack("metadata", "Metadata"); metadata.mode = "hidden";
+    const captions = video.addTextTrack("captions", "Native captions"); captions.mode = "showing";
+    const dispose = attachSubtitles(video, null, () => enabled);
+    const hidden = captions.mode === "hidden";
+    enabled = true; video.dispatchEvent(new Event("subtitle-preference"));
+    const shown = captions.mode === "showing";
+    const metadataPreserved = metadata.mode === "hidden";
+    dispose();
+    return { hidden, shown, metadataPreserved };
+  });
+  assert.deepEqual(native, { hidden: true, shown: true, metadataPreserved: true });
+  return { persistence: true, new_source: true, late_tracks: true, native };
+}
+
+async function hlsSubtitleChecks(page) {
+  await loadPlayer(page, false, "&subtitle_hls=1");
+  const showing = () => page.waitForFunction(() => Array.from(document.querySelector("video").textTracks).some(track => track.mode === "showing" && Array.from(track.activeCues || []).some(cue => cue.text.includes("Real HLS subtitles"))));
+  await showing();
+  const toggle = async () => { await page.mouse.move(650, 450); await page.getByRole("button", { name: "字幕", exact: true }).click(); };
+  await toggle();
+  await page.waitForFunction(() => window.playerSeekFixture.engineState().subtitleTrack === -1 && !window.playerSeekFixture.engineState().subtitleDisplay);
+  await clickProgress(page, .6);
+  await page.waitForFunction(() => document.querySelector("video").currentTime > 50 && !document.querySelector("video").seeking);
+  await toggle(); await showing();
+  assert((await page.evaluate(() => document.querySelector("video").currentTime)) > 50, "Enabling subtitles must preserve playback position");
+  await toggle(); await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  await page.waitForFunction(() => window.playerSeekFixture.engineState().subtitleCount === 1);
+  assert.equal(await page.getByRole("button", { name: "字幕", exact: true }).getAttribute("aria-pressed"), "false");
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.engineState().subtitleTrack), -1);
+  await toggle(); await showing();
+  return { hls_vtt: true, mid_playback_enable: true, persisted_off: true, playback_position_preserved: true };
+}
+
+async function seekChecks(page, legacy) {
+  await loadPlayer(page, legacy, "&cache_seek=1");
   await clickProgress(page, .1);
   assert.equal((await getLogs(page)).length, 0, "Default-off must not record seeks");
   await page.getByRole("button", { name: "诊断设置", exact: true }).click();
   await page.getByRole("button", { name: "播放诊断日志", exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="播放诊断日志"]').getAttribute("aria-pressed") === "true");
   await page.getByRole("button", { name: "诊断设置", exact: true }).click();
+  const clickGap = await page.evaluate(() => window.playerSeekFixture.primeCache(.8));
   await clickProgress(page, .8);
+  await page.waitForFunction(({ url, edge }) => window.playerSeekFixture.cacheWrites.some(write => write.url === url && write.time < edge), clickGap);
   let logs = await waitLog(page, "seek.resumed");
   const first = logs.find(e => e.event === "seek.request" && e.data.source === `${legacy ? "legacy" : "desktop"}_click`);
   assert(first, "Actual click must request a seek");
@@ -94,6 +194,7 @@ async function seekChecks(page, legacy) {
   assert(logs.some(e => e.event === "seek.resumed" && e.data.seek === first.data.seek), "Click must recover a frame with matching seek ID");
 
   const before = logs.length;
+  const dragGap = await page.evaluate(() => window.playerSeekFixture.primeCache(.45));
   const r = await page.getByRole("slider", { name: "播放进度" }).boundingBox();
   const current = await page.locator("video").evaluate(v => v.currentTime / v.duration);
   await page.mouse.move(r.x + r.width * current, r.y + r.height / 2);
@@ -108,6 +209,7 @@ async function seekChecks(page, legacy) {
   const preview = await page.getByRole("slider", { name: "播放进度" }).inputValue();
   assert(Math.abs(Number(preview) - 40.5) < .5, "Seekbar must preview the target before release");
   await page.mouse.up();
+  await page.waitForFunction(({ url, edge }) => window.playerSeekFixture.cacheWrites.some(write => write.url === url && write.time < edge), dragGap);
   await page.waitForFunction(n => window.playerSeekFixture.logs.slice(n).some(e => e.event === "seek.resumed"), before);
   logs = (await getLogs(page)).slice(before);
   const drags = logs.filter(e => e.event === "seek.request" && e.data.source === `${legacy ? "legacy" : "desktop"}_drag`);
@@ -275,6 +377,94 @@ async function lifecycleCheck(page) {
   return { feed, legacy, late_mount_paused: true };
 }
 
+async function loadResumeFixture(page, extra = '') {
+  await page.addInitScript(() => {
+    if (sessionStorage.getItem('progress-fixture-seeded')) return;
+    sessionStorage.setItem('progress-fixture-seeded', '1');
+    // The old format has no independent progress map.
+    localStorage.setItem('hghub_app_v1', JSON.stringify({ favs: [991], history: [
+      { id: 991, ep: 3, t: 35, dur: 90, at: Date.now() },
+      { id: 992, ep: 4, t: 22, dur: 90, at: Date.now() - 1 },
+    ] }));
+  });
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&resume=1&proxy=${encodeURIComponent(report.media)}${extra}`);
+  await page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByText('续播视频 991', { exact: true }).waitFor();
+}
+const openCategoryVideo = page => page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByRole('button', { name: /续播视频 991/ }).click();
+async function expectPlayback(page, ep, time, id = 991) {
+  await page.waitForFunction(({ ep, time, id }) => {
+    const fixture = window.playerSeekFixture, video = document.querySelector('video');
+    const content = video?.closest('section')?.textContent ?? '';
+    return fixture.playRequests.some(request => request.id === id && request.ep === ep)
+      && content.includes(`续播视频 ${id}`) && content.includes(`第 ${ep}/8 集`)
+      && fixture.getProgress(id)?.ep === ep && video && !video.paused && !video.seeking && video.readyState >= 2
+      && video.currentTime >= time && video.currentTime < time + 6;
+  }, { ep, time, id });
+}
+async function backFromPlayer(page) {
+  await page.mouse.move(450, 100);
+  await page.getByRole('button', { name: '返回', exact: true }).last().click();
+  await page.locator('video').waitFor({ state: 'detached' });
+}
+async function pickEpisode(page, ep) {
+  await page.locator('input[aria-label="播放进度"]').evaluate(input => input.blur());
+  await page.keyboard.press('e');
+  await page.getByRole('button', { name: String(ep), exact: true }).click();
+}
+async function progressChecks(page) {
+  await loadResumeFixture(page);
+  await openCategoryVideo(page);
+  await expectPlayback(page, 3, 35);
+  const initial = await page.evaluate(() => window.playerSeekFixture.getProgress(991).t);
+  await page.waitForFunction(time => window.playerSeekFixture.getProgress(991).t >= time + 4, initial);
+  await page.evaluate(() => window.playerSeekFixture.setActive(false));
+  const hidden = await page.evaluate(() => JSON.parse(localStorage.getItem('hghub_app_v1')).progress[991]);
+  assert.equal(hidden.ep, 3);
+  assert(hidden.t >= 35);
+  const resumeTime = Math.floor(hidden.t);
+  await backFromPlayer(page);
+  const retained = await page.evaluate(() => {
+    for (let i = 1000; i < 1081; i++) window.playerSeekFixture.record(i, 6, 17, 90);
+    const saved = JSON.parse(localStorage.getItem('hghub_app_v1'));
+    return { count: saved.history.length, recent: saved.history.some(entry => entry.id === 991), old: saved.progress[991] };
+  });
+  assert.equal(retained.count, 80);
+  assert.equal(retained.recent, false);
+  assert.equal(retained.old.ep, 3);
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 3, resumeTime);
+  await page.evaluate(() => {
+    const fixture = window.playerSeekFixture;
+    const oldWriter = fixture.claim(991), newWriter = fixture.claim(991);
+    fixture.record(991, 7, 12, 90, newWriter);
+    fixture.record(991, 1, 0, 90, oldWriter);
+  });
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.getProgress(991).ep), 7, 'Stale player cleanup cannot overwrite a newer writer');
+  const cleared = await page.evaluate(() => {
+    const fixture = window.playerSeekFixture, writer = fixture.claim(991);
+    fixture.clearHistory();
+    fixture.record(991, 7, 12, 90, writer);
+    window.dispatchEvent(new Event('pagehide'));
+    const saved = JSON.parse(localStorage.getItem('hghub_app_v1'));
+    return { history: saved.history, progress: saved.progress };
+  });
+  assert.deepEqual(cleared, { history: [], progress: {} });
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 1, 0);
+  await page.evaluate(() => {
+    // Invalidate the current player before seeding the completion scenario.
+    window.playerSeekFixture.claim(991);
+    window.playerSeekFixture.record(991, 3, 85, 90);
+  });
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 3, 85);
+  await page.evaluate(() => { window.playerSeekFixture.failEpisode = 4; });
+  await clickProgress(page, .999);
+  await page.getByText('Fixture episode unavailable', { exact: true }).waitFor();
+  const ended = await page.evaluate(() => window.playerSeekFixture.getProgress(991));
+  assert.equal(ended.ep, 3, 'Only actual playback of the next episode can advance the saved episode');
+  assert.equal(ended.t, ended.dur);
+  await backFromPlayer(page); await openCategoryVideo(page); await expectPlayback(page, 3, 0);
+  return { legacy_migration: true, periodic_save: true, retention_beyond_80: true, restart_persistence: true, inactive_flush: true, stale_writer_rejected: true, explicit_clear: true, completed_episode_replay: true };
+}
+
 try {
   let mediaDir = args["media-dir"] && resolve(args["media-dir"]);
   if (!mediaDir) {
@@ -285,12 +475,22 @@ try {
   }
   vite = await createViteServer({ root, server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, open: false } });
   await vite.listen(); report.ui = `http://127.0.0.1:${vite.httpServer.address().port}`;
-  media = await serveMedia(mediaDir); report.media = `http://127.0.0.1:${media.address().port}`;
+  let mp4;
+  if (scenarios.includes('mp4-cache')) {
+    const target = join(output, 'fixture.mp4');
+    execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', join(mediaDir, 'list.m3u8'), '-c', 'copy', '-movflags', '+faststart', target], { timeout: 60000, stdio: 'pipe' });
+    mp4 = await readFile(target); report.mp4_bytes = mp4.length;
+  }
+  media = await serveMedia(mediaDir, mp4); report.media = `http://127.0.0.1:${media.address().port}`;
+  if (scenarios.some(name => ['cache-resume', 'mp4-cache'].includes(name))) backend = await startBackend(root);
   browser = await chromium.launch({ headless: true, executablePath: args["browser-executable"], args: ["--autoplay-policy=no-user-gesture-required"] });
   report.browser_version = browser.version();
   for (const name of scenarios) {
     const dir = join(output, name); await mkdir(dir);
-    const context = await browser.newContext({ viewport: { width: 1000, height: 900 } });
+    const integrated = ['cache-resume', 'mp4-cache'].includes(name);
+    if (integrated) { await backend.command('set', { maxMib: 256 }); await backend.command('clear'); }
+    const context = await browser.newContext({ viewport: { width: 1000, height: 900 },
+      ...(integrated ? { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36' } : {}) });
     await context.exposeBinding("collectPlaybackLogs", (_source, entries) => {
       for (const e of entries) jsonl(join(dir, "playback.jsonl"), { ts: e.data.at, event: `web.${e.event}`, data: e.data, transport: "browser-fixture" });
     });
@@ -298,9 +498,13 @@ try {
     const page = await context.newPage(), pageErrors = [], externalRequests = [];
     page.setDefaultTimeout(15000);
     // Nothing in these tests should contact an upstream service.
-    await context.route("**/*", route => {
+    await context.route("**/*", async route => {
       const url = new URL(route.request().url());
-      if ([report.ui, report.media].includes(url.origin)) return route.continue();
+      if (integrated && url.hostname === 'hg.localhost') {
+        const response = await route.fetch({ url: `${backend.origin}${url.pathname}${url.search}` });
+        return route.fulfill({ response });
+      }
+      if ([report.ui, report.media, backend?.origin].includes(url.origin)) return route.continue();
       externalRequests.push({ protocol: url.protocol, host: url.hostname }); return route.abort("blockedbyclient");
     });
     const ids = new WeakMap(); let requestId = 0;
@@ -312,7 +516,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = regressionChecks[name] ? regressionChecks[name](page, { report, backend, mediaRequests, loadResumeFixture, openCategoryVideo, expectPlayback, backFromPlayer, pickEpisode, clickProgress }) : name === "progress" ? progressChecks(page) : name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");
@@ -335,6 +539,7 @@ try {
   report.setup_error = error.message; console.error(error.message);
 } finally {
   await browser?.close();
+  if (backend) await backend.stop().catch(error => { report.backend_error = error.message; report.setup_error = error.message; });
   for (const socket of requests) socket.destroy();
   if (media) await new Promise(done => media.close(done));
   await vite?.close();

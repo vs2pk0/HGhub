@@ -2,33 +2,20 @@ package app.hghub.mobile.data
 
 import android.util.Base64
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.URI
-import java.util.concurrent.TimeUnit
 
 class ApiException(message: String) : Exception(message)
 
 class HgApi(private val store: AppStore) {
     private val jsonType = "application/json; charset=utf-8".toMediaType()
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
+    private val http = safeHttp
 
     private fun guard(raw: String) {
-        val uri = runCatching { URI(raw) }.getOrElse { throw ApiException("地址无效") }
-        if (!uri.scheme.equals("https", true)) throw ApiException("只允许 HTTPS")
-        val host = uri.host?.lowercase().orEmpty()
-        if (host.isBlank() || host == "localhost" || host.endsWith(".local") || isPrivate(host)) {
-            throw ApiException("目标地址不可用")
-        }
+        checkedUrl(raw)
     }
 
     suspend fun feed(page: Int, size: Int = 10): Pair<List<VideoCard>, PageInfo> =
@@ -80,32 +67,34 @@ class HgApi(private val store: AppStore) {
     }
 
     suspend fun login(username: String, password: String): Account = withContext(Dispatchers.IO) {
-        ensureTrusted()
+        val context = snapshot()
         val data = call(
             "POST",
             "/api/account/loginByPassword",
             JSONObject().put("username", username).put("password", password),
             auth = false,
+            context = context,
         )
-        saveSession(data)
+        saveSession(data, context)
     }
 
     suspend fun register(username: String, password: String, email: String): Account = withContext(Dispatchers.IO) {
-        ensureTrusted()
+        val context = snapshot()
         val body = JSONObject()
             .put("username", username)
             .put("password", password)
             .put("confirm_password", password)
         if (email.isNotBlank()) body.put("email", email)
-        val data = call("POST", "/api/account/registerByPassword", body, auth = false)
-        saveSession(data)
+        val data = call("POST", "/api/account/registerByPassword", body, auth = false, context = context)
+        saveSession(data, context)
     }
 
     suspend fun logout() {
+        val context = snapshot()
         withContext(Dispatchers.IO) {
-            runCatching { call("POST", "/api/account/logout", null, auth = true) }
+            runCatching { call("POST", "/api/account/logout", null, auth = true, context = context) }
         }
-        store.logout()
+        withContext(Dispatchers.Main.immediate) { store.logout(context) }
     }
 
     /** 地址发布页上的镜像线路。失败时由界面提示，不自动切换。 */
@@ -127,7 +116,7 @@ class HgApi(private val store: AppStore) {
             val names = if (subs.isEmpty()) listOf(host) else subs.map { "$it.$host" }
             for (name in names) {
                 val url = "https://$name"
-                if (runCatching { guard(url) }.isSuccess) out.add(url)
+                runCatching { checkedOrigin(url) }.getOrNull()?.let { out.add(it) }
                 if (out.size >= 40) return@withContext out.toList()
             }
         }
@@ -149,25 +138,26 @@ class HgApi(private val store: AppStore) {
         }
     }
 
-    private fun saveSession(data: JSONObject): Account {
+    private suspend fun saveSession(data: JSONObject, context: SessionContext): Account {
         val token = data.str("token")
         if (token.isBlank()) throw ApiException("登录返回缺少 token")
         val user = data.obj("user")?.toAccount() ?: throw ApiException("登录返回缺少用户")
-        store.setSession(token, user)
+        val saved = withContext(Dispatchers.Main.immediate) { store.setSession(token, user, context) }
+        if (!saved) throw ApiException("登录期间线路或会话已变化，请重新登录")
         return user
     }
 
-    private fun ensureTrusted() {
-        if (!store.trustedLine) throw ApiException("镜像线路仅供游客浏览，登录请切换到固定线路")
-    }
+    private suspend fun snapshot() = withContext(Dispatchers.Main.immediate) { store.sessionContext() }
 
     private suspend fun get(path: String, origin: String? = null): JSONObject =
         withContext(Dispatchers.IO) { call("GET", path, null, false, origin) }
 
-    private fun call(method: String, path: String, body: JSONObject?, auth: Boolean, originOverride: String? = null): JSONObject {
-        val origin = (originOverride ?: store.base).trim().trimEnd('/')
-        guard(origin)
-        if (auth && store.token.isBlank()) throw ApiException("请先登录")
+    private suspend fun call(method: String, path: String, body: JSONObject?, auth: Boolean, originOverride: String? = null, context: SessionContext? = null): JSONObject {
+        val captured = context ?: snapshot()
+        val origin = checkedOrigin(originOverride ?: captured.origin)
+        val accountRequest = auth || path == "/api/account/loginByPassword" || path == "/api/account/registerByPassword"
+        if (accountRequest && (!trustedOrigin(origin) || origin != captured.origin)) throw ApiException("镜像线路仅供游客浏览，登录请切换到固定线路")
+        if (auth && captured.token.isBlank()) throw ApiException("请先登录")
         val encoded = if (body == null) "" else Base64.encodeToString(body.toString().toByteArray(), Base64.NO_WRAP)
         val envelope = JSONObject()
             .put("method", method)
@@ -180,20 +170,22 @@ class HgApi(private val store: AppStore) {
             .header("User-Agent", UA)
             .header("Referer", "$origin/")
             .post(envelope.toString().toRequestBody(jsonType))
-        if (auth && store.token.isNotBlank()) {
-            reqBuilder.header("Authorization", "Bearer ${store.token}")
+        if (method == "GET" && body == null && !auth) {
+            reqBuilder.tag(GuestEnvelopeRead::class.java, GuestEnvelopeRead())
         }
-        val resp = http.newCall(reqBuilder.build()).execute()
-        val text = resp.body?.string().orEmpty()
-        if (resp.code == 401 || resp.code == 403) throw ApiException("请先登录")
-        if (!resp.isSuccessful) throw ApiException("服务器请求失败（HTTP ${resp.code}），请稍后重试或切换线路")
-        if (text.isBlank()) return JSONObject()
-        val value = runCatching { JSONObject(text) }.getOrElse { throw ApiException("接口返回无法解析") }
-        if (value.optInt("status", 0) == 1) {
-            return value.optJSONObject("data") ?: JSONObject()
+        if (auth) reqBuilder.header("Authorization", "Bearer ${captured.token}")
+        return http.newCall(reqBuilder.build()).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (resp.code == 401 || resp.code == 403) throw ApiException("请先登录")
+            if (!resp.isSuccessful) throw ApiException("服务器请求失败（HTTP ${resp.code}），请稍后重试或切换线路")
+            if (text.isBlank()) return@use JSONObject()
+            val value = runCatching { JSONObject(text) }.getOrElse { throw ApiException("接口返回无法解析") }
+            if (value.optInt("status", 0) == 1) {
+                return@use value.optJSONObject("data") ?: JSONObject()
+            }
+            val msg = value.optString("msg").ifBlank { "接口返回失败" }
+            throw ApiException(msg)
         }
-        val msg = value.optString("msg").ifBlank { "接口返回失败" }
-        throw ApiException(msg)
     }
 
     private fun text(url: String): String? {
@@ -210,15 +202,6 @@ class HgApi(private val store: AppStore) {
         const val UA =
             "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
     }
-}
-
-private fun isPrivate(host: String): Boolean {
-    val parts = host.split('.')
-    if (parts.size != 4 || parts.any { it.toIntOrNull() == null }) return false
-    val n = parts.map { it.toInt() }
-    if (n.any { it !in 0..255 }) return false
-    return n[0] == 10 || n[0] == 127 || (n[0] == 192 && n[1] == 168) ||
-        (n[0] == 172 && n[1] in 16..31) || (n[0] == 169 && n[1] == 254) || n[0] == 0
 }
 
 private fun scriptSrc(html: String): String? {

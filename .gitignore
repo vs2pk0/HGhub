@@ -1,5 +1,6 @@
 # 依赖
 node_modules/
+native/android/.kotlin/
 .pnpm-store/
 
 # 构建产物
@@ -24,6 +25,8 @@ native/ios/DerivedData/
 .DS_Store
 Thumbs.db
 *.log
+__pycache__/
+*.pyc
 
 # 签名与密钥（务必不要提交）
 *.keystore

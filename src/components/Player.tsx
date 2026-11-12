@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { fmtTime, playlist } from "../api";
+import { useStore } from "../store";
+import { attachSubtitles } from "../subtitles";
+import { attachPlaybackCache, attachDirectCache, type CacheRange } from "../playbackCache";
+import { fmtTime, platform, mediaUrl } from "../api";
 import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 import { useSeekInput } from "../useSeekInput";
 import PlaybackLock from "./PlaybackLock";
-import { ICompress, IExpand, ILockF, IPauseF, IPlayF, IVol, IVolMute } from "../icons";
+import { ICompress, IExpand, ILockF, ISubtitles, IPauseF, IPlayF, IVol, IVolMute } from "../icons";
 
 type Props = {
   src: string;              // 原始 m3u8 地址
@@ -27,14 +30,18 @@ export default function Player({
   src, poster, autoPlay, active = true, muted = false, loop = false, onEnded, onPlaying,
   onTogglePlay, onToggleMute, controls = true, className = "", diagnosticContext = {},
 }: Props) {
+  const { subtitlesEnabled, setSubtitlesEnabled } = useStore();
+  const subtitlesRef = useRef(subtitlesEnabled); subtitlesRef.current = subtitlesEnabled;
   const videoRef = useRef<HTMLVideoElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const recoverCountRef = useRef(0);
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { view: "post_detail", ...diagnosticContext, active, resource: mediaResource(src) });
   const activity = usePlaybackActivity(videoRef, hlsRef, { active, autoPlay: !!autoPlay, src, trace });
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [time, setTime] = useState(0);
+  const [cachedRanges, setCachedRanges] = useState<CacheRange[]>([]);
   const [duration, setDuration] = useState(0);
   const [full, setFull] = useState(false);
   const [rate, setRate] = useState(1);
@@ -46,6 +53,10 @@ export default function Player({
       const video = videoRef.current;
       if (!video || !activity.isActive()) return;
       requestSeek(target, `legacy_${input}`);
+      setWaiting(true);
+      if (hlsRef.current?.bufferingEnabled) {
+        try { hlsRef.current.startLoad(target); } catch { /* ignore */ }
+      }
       video.currentTime = target;
       trace("seek.assigned", { target });
       setTime(video.currentTime);
@@ -55,29 +66,42 @@ export default function Player({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
-    const url = playlist(src);
-    trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
+    const url = mediaUrl(src);
+    const useHls = !url.includes("/seg?u=");
+    recoverCountRef.current = 0;
+    setErrMsg("");
+    trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
 
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
-    if (Hls.isSupported()) {
+    let detachCache: (() => void) | undefined;
+    let detachSubtitles: (() => void) | undefined;
+    if (useHls && Hls.isSupported()) {
       const hls = new Hls({
         // 禁用从插播/内容引导 JSON 派生直连 URL 的可选功能。
         interstitialsController: undefined,
         contentSteeringController: undefined,
         enableInterstitialPlayback: false,
-        enableWorker: true,
+        enableWorker: platform !== "ios",
         // Keep the same macOS seek workaround as the shared player.
         preferManagedMediaSource: false,
         autoStartLoad: false,
         lowLatencyMode: false,
-        maxBufferLength: 24,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
         backBufferLength: 30,
+        maxBufferHole: 0.5,
+        nudgeOffset: 0.25,
+        nudgeMaxRetry: 6,
         manifestLoadingTimeOut: 20000,
-        manifestLoadingMaxRetry: 3,
-        fragLoadingMaxRetry: 4,
+        manifestLoadingMaxRetry: 4,
+        fragLoadingTimeOut: 25000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 400,
       });
       hlsRef.current = hls;
+      detachSubtitles = attachSubtitles(video, hls, () => subtitlesRef.current);
+      detachCache = attachPlaybackCache(hls, video, activity.isActive, setCachedRanges, undefined, () => subtitlesRef.current);
       observeHls(hls, trace);
       hls.loadSource(url);
       hls.attachMedia(video);
@@ -85,27 +109,56 @@ export default function Player({
         if (activity.isActive()) hls.startLoad();
         if (autoPlay) activity.play("manifest_autoplay", true);
       });
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        recoverCountRef.current = 0;
+        setErrMsg("");
+      });
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) return;
+        if (!data.fatal) {
+          if (
+            data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+            data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR
+          ) {
+            try { hls.startLoad(video.currentTime || -1); } catch { /* ignore */ }
+          }
+          return;
+        }
+        if (!activity.isActive()) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoverCountRef.current < 4) {
+          recoverCountRef.current += 1;
+          try { hls.startLoad(video.currentTime || -1); } catch { /* ignore */ }
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoverCountRef.current < 4) {
+          recoverCountRef.current += 1;
+          try { hls.recoverMediaError(); video.play().catch(() => {}); } catch { /* ignore */ }
+          return;
+        }
         const detail = `${data.type}/${data.details}/${data.response?.code ?? ""}/${String(data.reason ?? "").slice(0, 80)}`;
         (window as unknown as { __hlsErr?: string }).__hlsErr = detail;
         setErrMsg(detail);
-        if (!activity.isActive()) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
         else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
         else { hls.destroy(); hlsRef.current = null; }
       });
     } else {
       // Safari / 部分 WebView 原生支持 HLS
+      detachSubtitles = attachSubtitles(video, null, () => subtitlesRef.current);
+      detachCache = useHls ? attachPlaybackCache(null, video, activity.isActive, setCachedRanges, url, () => subtitlesRef.current)
+        : attachDirectCache(url, video, activity.isActive, setCachedRanges);
       video.src = url;
       if (autoPlay) activity.play("native_autoplay", true);
     }
 
     return () => {
       trace("source.cleanup");
+      detachCache?.();
+      detachSubtitles?.();
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
   }, [src, autoPlay]);
+
+  useEffect(() => { videoRef.current?.dispatchEvent(new Event("subtitle-preference")); }, [subtitlesEnabled]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -151,6 +204,8 @@ export default function Player({
         ref={videoRef}
         poster={poster}
         playsInline
+        webkit-playsinline="true"
+        preload="auto"
         muted={muted}
         loop={loop}
         className="w-full h-full object-contain bg-black"
@@ -158,7 +213,8 @@ export default function Player({
         onPlay={() => { if (activity.isActive()) { setPlaying(true); onTogglePlay?.(true); } }}
         onPause={() => { setPlaying(false); onTogglePlay?.(false); }}
         onWaiting={() => setWaiting(true)}
-        onPlaying={() => { if (activity.isActive()) { setWaiting(false); onPlaying?.(); } }}
+        onPlaying={() => { if (activity.isActive()) { setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
+        onSeeked={() => setWaiting(false)}
         onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
         onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration || 0)}
         onEnded={() => { if (activity.isActive()) onEnded?.(); }}
@@ -187,8 +243,13 @@ export default function Player({
 
       {controls && (
         <div className="absolute inset-x-0 bottom-0 px-3 pb-2 pt-8 bg-gradient-to-t from-black/80 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
-          <input aria-label="播放进度" type="range" {...seek.inputProps}
-            className="hg-range w-full" style={{ ...seek.inputProps.style, "--fill": `${pct}%` } as React.CSSProperties} />
+          <div className="desktop-seek is-seekable">
+            <div className="desktop-seek-track">
+              {duration > 0 && cachedRanges.map((range, i) => <span key={i} className="desktop-seek-buffer" style={{ left: `${Math.max(0, range.start / duration) * 100}%`, width: `${Math.max(0, Math.min(duration, range.end) - Math.max(0, range.start)) / duration * 100}%` }} />)}
+              <span className="desktop-seek-played" style={{ width: `${pct}%` }} />
+            </div>
+            <input aria-label="播放进度" type="range" {...seek.inputProps} />
+          </div>
           <div className="flex items-center gap-3 mt-1 text-white">
             <button onClick={toggle} aria-label={playing ? "暂停" : "播放"} className="pressable">
               {playing ? <IPauseF size={16} /> : <IPlayF size={16} />}
@@ -198,6 +259,8 @@ export default function Player({
             </button>
             <span className="text-[11px] tabular-nums text-white/85">{fmtTime(seek.time)} / {fmtTime(duration)}</span>
             <div className="flex-1" />
+            <button aria-label="字幕" aria-pressed={subtitlesEnabled} title={subtitlesEnabled ? "关闭字幕" : "显示字幕"}
+              onClick={() => setSubtitlesEnabled(!subtitlesEnabled)} className={`pressable ${subtitlesEnabled ? "text-primary" : "text-white/65"}`}><ISubtitles size={20} /></button>
             <button onClick={() => setControlsLocked(true)} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false} className="pressable">
               <ILockF size={16} />
             </button>

@@ -6,6 +6,13 @@ import LinePicker from "../components/LinePicker";
 import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, usePlaybackLog } from "../playbackDiagnostics";
 import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute } from "../icons";
 
+const Section = ({ title, children }: { title: string; children: ReactNode }) => (
+    <>
+      <div className="text-[10.5px] font-semibold text-dim tracking-wide px-1 mt-4 mb-1.5">{title}</div>
+      <div className="rounded-(--r-md) bg-s2 divide-y divide-s3">{children}</div>
+    </>
+  );
+
 /* 独立设置页：线路 / 外观 / 播放 / 本地数据 / 清理缓存 / 网络诊断 / 关于
    入口：Windows 侧栏「设置」、Android「我的」右上角齿轮 */
 export default function Settings({ onBack, wide }: { onBack: () => void; wide: boolean }) {
@@ -15,6 +22,13 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [clearing, setClearing] = useState(false);
   const [lineOpen, setLineOpen] = useState(false);
   const [lineBase, setLineBase] = useState("");
+  const [cacheLimit, setCacheLimit] = useState("");
+  const [cacheBytes, setCacheBytes] = useState(0);
+  const [cacheReady, setCacheReady] = useState(false);
+  const [cacheSaving, setCacheSaving] = useState(false);
+  const [cidrs, setCidrs] = useState("");
+  const [cidrsReady, setCidrsReady] = useState(false);
+  const [cidrsSaving, setCidrsSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const playbackLog = usePlaybackLog();
@@ -24,7 +38,22 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
     api.lineState().then((s) => setLineBase(s.base)).catch(() => {});
   };
   useEffect(readLine, []);
+  useEffect(() => {
+    api.playbackCacheStatus().then(({ max_mib, bytes }) => { setCacheLimit(String(max_mib)); setCacheBytes(bytes); setCacheReady(true); })
+      .catch(() => toast("无法读取播放缓存设置", "info"));
+  }, [toast]);
+  useEffect(() => {
+    api.securityCidrsGet().then((value) => { setCidrs(value); setCidrsReady(true); })
+      .catch(() => toast("无法读取 CIDR 例外设置", "info"));
+  }, [toast]);
   useEffect(() => { void initPlaybackLog(); }, []);
+  useEffect(() => {
+    let mounted = true;
+    const timer = window.setInterval(() => {
+      void api.playbackCacheStatus().then(({ bytes }) => { if (mounted) setCacheBytes(bytes); }).catch(() => {});
+    }, 2000);
+    return () => { mounted = false; window.clearInterval(timer); };
+  }, []);
 
   const checkUpdate = async () => {
     setChecking(true);
@@ -39,12 +68,6 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
     }
   };
 
-  const Section = ({ title, children }: { title: string; children: ReactNode }) => (
-    <>
-      <div className="text-[10.5px] font-semibold text-dim tracking-wide px-1 mt-4 mb-1.5">{title}</div>
-      <div className="rounded-(--r-md) bg-s2 divide-y divide-s3">{children}</div>
-    </>
-  );
 
   return (
     <div className="absolute inset-0 bg-bg flex flex-col">
@@ -86,6 +109,20 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               </div>
               <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
             </div>
+            <div className="px-3.5 py-3">
+              <label htmlFor="playback-cache-size" className="text-[12.5px] text-on">播放磁盘缓存上限（MiB）</label>
+              <div className="text-[10.5px] text-mut mt-1">0 为关闭并删除播放磁盘缓存；开启时填写 128–4096 的整数。当前占用 {(cacheBytes / 1048576).toFixed(1)} MiB。</div>
+              <div className="flex gap-2 mt-2">
+                <input id="playback-cache-size" type="number" min="0" max="4096" step="1" value={cacheLimit} onChange={(e) => setCacheLimit(e.target.value)} disabled={!cacheReady || cacheSaving} className="min-w-0 flex-1 rounded bg-s3 px-2 py-1 text-[12.5px] text-on" />
+                <button disabled={!cacheReady || cacheSaving} className="rounded bg-s3 px-3 py-1 text-[12.5px] text-on disabled:opacity-50" onClick={() => {
+                  const value = Number(cacheLimit);
+                  if (!/^\d+$/.test(cacheLimit) || (value !== 0 && (value < 128 || value > 4096))) { toast("请输入 0 或 128–4096 的整数", "info"); return; }
+                  setCacheSaving(true);
+                  void api.playbackCacheSet(value).then(() => api.playbackCacheStatus()).then((status) => { setCacheLimit(String(status.max_mib)); setCacheBytes(status.bytes); toast("播放缓存设置已保存", "ok"); })
+                    .catch((e) => toast((e as Error).message || "保存失败", "info")).finally(() => setCacheSaving(false));
+                }}>保存</button>
+              </div>
+            </div>
           </Section>
 
           <Section title="本地数据">
@@ -100,7 +137,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBroom size={16} /></span>
               <div className="flex-1">
                 <div className="text-[12.5px] text-on">清理缓存</div>
-                <div className="text-[10.5px] text-mut">封面 / 播放缓存与本地记录</div>
+                <div className="text-[10.5px] text-mut">封面和播放缓存</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
@@ -136,6 +173,19 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
                 label="严格安全模式"
               />
             </div>
+            {strictSecurity && <div className="px-3.5 py-3">
+              <label htmlFor="allowed-cidrs" className="text-[12.5px] text-on">允许连接的 IP CIDR 例外</label>
+              <div className="text-[10.5px] text-mut mt-1">IPv4 / IPv6 网段以英文逗号分隔，例如 fd00::/8, 10.20.0.0/16。198.18.0.0/15 已默认放行，无需填写。列表中的内网和保留地址也可连接，请仅填写可信网段。</div>
+              <div className="flex gap-2 mt-2">
+                <input id="allowed-cidrs" type="text" value={cidrs} onChange={(e) => setCidrs(e.target.value)} disabled={!cidrsReady || cidrsSaving} placeholder="留空表示无额外例外" className="min-w-0 flex-1 rounded bg-s3 px-2 py-1 text-[12.5px] text-on" />
+                <button disabled={!cidrsReady || cidrsSaving} className="rounded bg-s3 px-3 py-1 text-[12.5px] text-on disabled:opacity-50" onClick={() => {
+                  setCidrsSaving(true);
+                  void api.securityCidrsSet(cidrs).then((saved) => { setCidrs(saved); toast("CIDR 例外已保存", "ok"); })
+                    .catch((e) => toast((e as Error).message || "CIDR 例外保存失败", "info"))
+                    .finally(() => setCidrsSaving(false));
+                }}>保存</button>
+              </div>
+            </div>}
             {/* 打不开时先点这里：把 DNS / 代理 / HTTP 结果复制给维护者 */}
             <button onClick={async () => {
               try {
@@ -201,7 +251,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
             </button>
           </Section>
 
-          <div className="text-center text-[10px] text-dim mt-5">HGhub {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : "Windows"} 客户端</div>
+          <div className="text-center text-[10px] text-dim mt-5">HGhub {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} 客户端</div>
         </div>
       </div>
 
@@ -218,7 +268,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
           </div>
 
           <p className="text-[12px] text-on/70 leading-relaxed mt-4">
-            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS 与 Android。
+            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS、Android 与 Linux。
             界面遵循 Fluent 设计语言，播放器采用沉浸式竖屏信息流。
           </p>
 
@@ -255,16 +305,19 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
         <div className="p-5">
           <div className="text-[14.5px] font-bold text-on">清理缓存</div>
           <p className="text-[12px] text-mut leading-relaxed mt-2">
-            只清除封面与播放列表缓存（解密图 / m3u8）。收藏、观看记录、搜索历史与登录状态都会保留。
+            清除封面、播放列表、分片、密钥及磁盘播放缓存。收藏、观看记录、搜索历史与登录状态都会保留。
           </p>
           <div className="flex gap-2 mt-5">
             <button onClick={() => setClearOpen(false)} className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[12.5px] text-on/80 pressable">取消</button>
             <button disabled={clearing} onClick={async () => {
               setClearing(true);
-              try { await api.clearCache(); } catch { /* 忽略 */ }
-              setClearing(false);
-              setClearOpen(false);
-              toast("缓存已清理", "ok");
+              try {
+                await api.clearCache();
+                setCacheBytes(0);
+                setClearOpen(false);
+                toast("缓存已清理", "ok");
+              } catch (e) { toast((e as Error).message || "缓存清理失败", "info"); }
+              finally { setClearing(false); }
             }} className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[12.5px] font-semibold text-on-primary pressable disabled:opacity-60">
               {clearing ? "清理中…" : "确定清理"}
             </button>

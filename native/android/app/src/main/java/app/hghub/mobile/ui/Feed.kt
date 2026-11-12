@@ -99,7 +99,8 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import app.hghub.mobile.data.safeHttp
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -159,9 +160,8 @@ fun VideoFeed(
         pageCount = { if (episodePaging) episodeTotal.coerceAtLeast(1) else ids.size.coerceAtLeast(1) },
     )
     val dataSource = remember {
-        DefaultHttpDataSource.Factory()
+        OkHttpDataSource.Factory(safeHttp)
             .setUserAgent(HgApiUa)
-            .setAllowCrossProtocolRedirects(true)
     }
     val player = remember {
         ExoPlayer.Builder(context)

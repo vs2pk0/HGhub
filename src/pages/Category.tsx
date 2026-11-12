@@ -96,7 +96,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
                   全部<IChevR size={14} />
                 </span>
               </button>
-              <div className="scroll-x flex gap-2.5 px-4 snap-x">
+              <div className="category-preview scroll-x flex gap-2.5 px-4 snap-x">
                 {list.map((v) => (
                   <RowCard key={v.id} v={v} onOpen={() => push({ kind: "feed", videoIds: list.map((x) => x.id), index: list.findIndex((x) => x.id === v.id), title: c.name })} />
                 ))}
@@ -121,7 +121,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
               全部<IChevR size={14} />
             </span>
           </button>
-          <div className="scroll-x flex gap-2.5 px-4 snap-x">
+          <div className="category-preview scroll-x flex gap-2.5 px-4 snap-x">
             {posts.map((post) => (
               <button key={post.id} onClick={() => push({ kind: "post", id: post.id })}
                 className="w-[104px] shrink-0 text-left snap-start pressable">

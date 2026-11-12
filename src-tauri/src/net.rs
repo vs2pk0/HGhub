@@ -150,6 +150,7 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
 
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
+static CLIENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
@@ -166,7 +167,8 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let key = format!("{strict}:{host}:{port}");
+    let generation = CLIENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    let key = format!("{generation}:{strict}:{host}:{port}");
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
@@ -194,6 +196,7 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
 }
 
 pub fn refresh_client() {
+    CLIENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut cache) = CLIENTS.lock() {
         cache.clear();
     }
@@ -205,6 +208,16 @@ pub async fn get(
     timeout: Duration,
     accept: Option<&str>,
     referer: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    get_with_range(raw, timeout, accept, referer, None).await
+}
+
+pub async fn get_with_range(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    range: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
@@ -222,6 +235,10 @@ pub async fn get(
             }
             if let Some(value) = referer {
                 request = request.header("Referer", value);
+            }
+            if let Some(value) = range {
+                request = request.header(reqwest::header::RANGE, value)
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity");
             }
             let response = request.send().await.map_err(|e| err_text(&e))?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
@@ -430,7 +447,7 @@ fn edge_operation(path: &str) -> &'static str {
     let path = path.split('?').next().unwrap_or("");
     if path.starts_with("/api/videos/category/") {
         "category"
-    } else if path.starts_with("/api/videos/") && path.ends_with("/play") {
+    } else if path.starts_with("/api/videos/") && (path.ends_with("/play") || path.ends_with("/playback")) {
         "play"
     } else if path == "/api/videos" {
         "feed"
@@ -511,7 +528,9 @@ pub async fn edge(
     let operation = edge_operation(path);
     let mut attempt = 0;
     let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
-    let can_retry = method.eq_ignore_ascii_case("GET") && body.is_none();
+    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试
+    let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
+        || (method.eq_ignore_ascii_case("POST") && operation == "play");
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
@@ -700,6 +719,7 @@ mod tests {
             ("/api/videos?page=1&size=10", "feed"),
             ("/api/videos/category/private?x=secret", "category"),
             ("/api/videos/42/play?ep=1", "play"),
+            ("/api/videos/42/episodes/1/playback", "play"),
             ("/api/search?q=private-search", "search"),
             ("/api/account/loginByPassword", "account"),
             ("/unknown/private", "other"),

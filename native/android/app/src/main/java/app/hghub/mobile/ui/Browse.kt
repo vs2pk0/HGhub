@@ -1,5 +1,7 @@
 package app.hghub.mobile.ui
 
+import app.hghub.mobile.data.safeHttp
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -410,10 +412,9 @@ private fun InlineClip(url: String) {
     val base = app.store.base
     val player = remember(url, base) {
         val headers = mapOf("Referer" to base.trimEnd('/') + "/", "Origin" to base.trimEnd('/'))
-        val dataSource = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+        val dataSource = androidx.media3.datasource.okhttp.OkHttpDataSource.Factory(safeHttp)
             .setUserAgent("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36")
             .setDefaultRequestProperties(headers)
-            .setAllowCrossProtocolRedirects(true)
         androidx.media3.exoplayer.ExoPlayer.Builder(context)
             .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSource))
             .build().apply {

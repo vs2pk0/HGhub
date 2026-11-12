@@ -1,3 +1,4 @@
+import { CardGrid } from "../components/CardGrid";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, cover, fmt, isMobile } from "../api";
 import type { Post } from "../types";
@@ -55,10 +56,10 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
       </div>
       <div className="flex-1 scroll-y px-3 pt-3 pb-8">
         {items.length ? (
-          <div className={`${wide ? "columns-3 xl:columns-4" : "columns-2"} gap-2`}>
+          <CardGrid gap={8}>
             {items.map((p) => (
               <button key={p.id} onClick={() => push({ kind: "post", id: p.id })}
-                className="w-full break-inside-avoid mb-2 relative rounded-(--r-sm) overflow-hidden bg-s1 elev-1 pressable block"
+                className="min-w-0 w-full relative rounded-(--r-sm) overflow-hidden bg-s1 elev-1 pressable block"
                 style={{ paddingTop: "128%" }}>
                 <Img src={p.cover} />
                 <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/90 via-black/40 to-transparent" />
@@ -70,7 +71,7 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
                 </div>
               </button>
             ))}
-          </div>
+          </CardGrid>
         ) : loading ? (
           <div className="flex justify-center py-12"><div className="w-8 h-8 spinner" /></div>
         ) : (

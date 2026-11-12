@@ -51,6 +51,7 @@ export function usePlaybackActivity(
       if (wanted.current && (hls?.levels.length || v.readyState > 0)) play("page_active", true);
     }
     previous.current = active;
+    v.dispatchEvent(new Event("playback-activity"));
   }, [active, play]);
 
   useLayoutEffect(() => {

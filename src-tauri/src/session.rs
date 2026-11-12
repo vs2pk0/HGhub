@@ -3,6 +3,24 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::io::Write;
+
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(text.as_bytes())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Session {
@@ -47,6 +65,24 @@ mod tests {
         assert_eq!(store.token("https://huangguoai.com"), None);
         assert!(store.user("https://huangguoai.com").is_null());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_credentials_are_private_even_for_legacy_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hghub-session-permissions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = SessionStore::new();
+        store.bind(dir.clone());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        store.set("https://huangguoai.com", "private-token".into(), json!({"id": 1}));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub struct SessionStore {
@@ -63,8 +99,18 @@ impl SessionStore {
     }
 
     pub fn bind(&self, dir: PathBuf) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let mut path = dir;
         path.push("session.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(sess) = serde_json::from_str::<Session>(&text) {
                 *self.current.lock().unwrap() = sess;
@@ -111,7 +157,7 @@ impl SessionStore {
         let snapshot = self.current.lock().unwrap().clone();
         if let Some(path) = self.file.lock().unwrap().as_ref() {
             if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
-                let _ = std::fs::write(path, text);
+                let _ = write_private(path, &text);
             }
         }
     }

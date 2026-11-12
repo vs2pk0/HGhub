@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Combine
 
 /// 本地回环代理：给 AVPlayer 改写 m3u8，并在上游请求上带 Referer。
 final class MediaProxy: ObservableObject {
@@ -8,6 +9,8 @@ final class MediaProxy: ObservableObject {
     private var extraHeaders: [String: String] = [:]
     private var listenFD: Int32 = -1
     private let lock = NSLock()
+    private let clients = DispatchSemaphore(value: 8)
+    private let route = "/v/" + UUID().uuidString
     private let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
     func start(referer: String) {
@@ -58,7 +61,7 @@ final class MediaProxy: ObservableObject {
     }
 
     func wrap(_ remote: String) -> URL? {
-        guard port > 0, var parts = URLComponents(string: "http://127.0.0.1:\(port)/v") else { return nil }
+        guard allow(remote), port > 0, var parts = URLComponents(string: "http://127.0.0.1:\(port)\(route)") else { return nil }
         parts.queryItems = [URLQueryItem(name: "u", value: remote)]
         return parts.url
     }
@@ -73,9 +76,14 @@ final class MediaProxy: ObservableObject {
         while listenFD >= 0 {
             let fd = accept(listenFD, nil, nil)
             if fd < 0 { continue }
+            guard clients.wait(timeout: .now()) == .success else { close(fd); continue }
             Thread.detachNewThread { [weak self] in
-                self?.handle(fd)
-                close(fd)
+                guard let self else { close(fd); return }
+                defer { close(fd); self.clients.signal() }
+                var timeout = timeval(tv_sec: 10, tv_usec: 0)
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+                self.handle(fd)
             }
         }
     }
@@ -91,8 +99,10 @@ final class MediaProxy: ObservableObject {
         }
         guard let text = String(data: header, encoding: .utf8),
               let line = text.components(separatedBy: "\r\n").first,
+              line.hasPrefix("GET ") || line.hasPrefix("HEAD "),
               let target = line.split(separator: " ").dropFirst().first,
               let url = URL(string: "http://127.0.0.1" + target),
+              url.path == route,
               let remote = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "u" })?.value,
               allow(remote), let remoteURL = URL(string: remote) else {
             write(fd, status: 400, type: "text/plain", body: Data("bad request".utf8))
@@ -112,11 +122,13 @@ final class MediaProxy: ObservableObject {
         let sem = DispatchSemaphore(value: 0)
         var data: Data?
         var http: HTTPURLResponse?
-        URLSession.shared.dataTask(with: req) { body, resp, _ in
-            data = body
-            http = resp as? HTTPURLResponse
+        Task {
+            if let result = try? await safeData(for: req) {
+                data = result.0
+                http = result.1
+            }
             sem.signal()
-        }.resume()
+        }
         sem.wait()
         guard let data, let http, (200..<300).contains(http.statusCode) else {
             write(fd, status: 502, type: "text/plain", body: Data("upstream".utf8))
@@ -125,7 +137,7 @@ final class MediaProxy: ObservableObject {
         let prefix = String(data: data.prefix(16), encoding: .utf8) ?? ""
         if prefix.contains("#EXTM3U") || (http.value(forHTTPHeaderField: "Content-Type") ?? "").contains("mpegurl") {
             let text = String(data: data, encoding: .utf8) ?? ""
-            let rewritten = rewrite(text, base: remote)
+            let rewritten = rewrite(text, base: http.url?.absoluteString ?? remote)
             write(fd, status: 200, type: "application/vnd.apple.mpegurl", body: Data(rewritten.utf8))
         } else {
             let type = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"

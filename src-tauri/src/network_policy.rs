@@ -1,5 +1,6 @@
 //! 不可信目标的连接策略。FakeIP 是明确例外，不能把它当作普通私网拒绝。
 use once_cell::sync::Lazy;
+use ipnet::IpNet;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ pub fn cli_strict_override() -> Option<bool> {
 
 static STRICT: Lazy<AtomicBool> =
     Lazy::new(|| AtomicBool::new(cli_strict_override().unwrap_or(true)));
+static ALLOWED_CIDRS: Lazy<RwLock<Vec<IpNet>>> = Lazy::new(|| RwLock::new(Vec::new()));
 static SECURITY_FILE: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
 
 /// 当前是否启用严格安全模式（默认开启）。
@@ -54,11 +56,16 @@ pub fn strict_security() -> bool {
 /// 启动时读取落盘的安全模式设置；若命令行显式指定了 `--no-strict` 等参数，则以命令行参数为准。
 pub fn bind_security(dir: &Path) {
     let path = dir.join("security.json");
-    if cli_strict_override().is_none() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if cli_strict_override().is_none() {
                 if let Some(strict) = v.get("strict").and_then(|x| x.as_bool()) {
                     STRICT.store(strict, Ordering::Relaxed);
+                }
+            }
+            if let Some(raw) = v.get("allowed_cidrs").and_then(|x| x.as_str()) {
+                if let Ok(cidrs) = parse_cidrs(raw) {
+                    if let Ok(mut current) = ALLOWED_CIDRS.write() { *current = cidrs; }
                 }
             }
         }
@@ -73,11 +80,50 @@ pub fn set_strict_security(strict: bool) -> Result<(), String> {
     let file = SECURITY_FILE.write().map_err(|_| "安全设置锁失败")?;
     let path = file.as_ref().ok_or("安全设置尚未初始化")?;
     let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, json!({ "strict": strict }).to_string())
+    std::fs::write(&temp, json!({ "strict": strict, "allowed_cidrs": allowed_cidrs() }).to_string())
         .and_then(|_| std::fs::rename(&temp, path))
         .map_err(|_| "无法保存安全设置，请检查应用数据目录")?;
     STRICT.store(strict, Ordering::Relaxed);
     Ok(())
+}
+
+fn parse_cidrs(raw: &str) -> Result<Vec<IpNet>, String> {
+    if raw.trim().is_empty() { return Ok(Vec::new()); }
+    raw.split(',').map(|item| {
+        let item = item.trim();
+        if !item.contains('/') { return Err(format!("无效的 CIDR：{item}")); }
+        item.parse::<IpNet>().map(|net| net.trunc()).map_err(|_| format!("无效的 CIDR：{item}"))
+    }).collect()
+}
+
+pub fn allowed_cidrs() -> String {
+    ALLOWED_CIDRS.read().map(|nets| nets.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+}
+
+pub fn set_allowed_cidrs(raw: &str) -> Result<String, String> {
+    let nets = parse_cidrs(raw)?;
+    let normalized = nets.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let file = SECURITY_FILE.write().map_err(|_| "安全设置锁失败")?;
+    let path = file.as_ref().ok_or("安全设置尚未初始化")?;
+    let mut current = ALLOWED_CIDRS.write().map_err(|_| "安全设置锁失败")?;
+    // 启动参数只覆盖当前模式，修改列表时保留原来持久化的模式。
+    let saved_strict = std::fs::read_to_string(path).ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v| v.get("strict").and_then(Value::as_bool))
+        .unwrap_or(true);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json!({ "strict": saved_strict, "allowed_cidrs": normalized }).to_string())
+        .and_then(|_| std::fs::rename(&temp, path))
+        .map_err(|_| "无法保存安全设置，请检查应用数据目录")?;
+    *current = nets;
+    Ok(normalized)
+}
+
+fn matches_cidrs(ip: IpAddr, nets: &[IpNet]) -> bool {
+    nets.iter().any(|net| net.contains(&ip) || match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| net.contains(&IpAddr::V4(v4))),
+        IpAddr::V4(_) => false,
+    })
 }
 
 fn is_internal_webview_host(name: &str) -> bool {
@@ -89,6 +135,7 @@ fn is_internal_webview_host(name: &str) -> bool {
 }
 
 pub fn allowed_ip(ip: IpAddr) -> bool {
+    if ALLOWED_CIDRS.read().map(|nets| matches_cidrs(ip, &nets)).unwrap_or(false) { return true; }
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();
@@ -162,7 +209,7 @@ fn check_ip(ip: IpAddr) -> Result<(), String> {
     if allowed_ip(ip) {
         Ok(())
     } else {
-        Err("禁止访问普通内网、回环或保留地址（仅放行 FakeIP 198.18.0.0/15）".into())
+        Err("禁止访问普通内网、回环或保留地址（可在安全设置中配置 CIDR 例外）".into())
     }
 }
 
@@ -245,13 +292,37 @@ mod tests {
         let previous = SECURITY_FILE.write().unwrap().replace(path.clone());
         let before = strict_security();
         set_strict_security(before).unwrap();
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["strict"], before);
+        let previous_nets = ALLOWED_CIDRS.read().unwrap().clone();
+        assert_eq!(set_allowed_cidrs("fd12:3456::1/32").unwrap(), "fd12:3456::/32");
+        assert!(allowed_ip("fd12:3456::5".parse().unwrap()));
+        assert!(set_allowed_cidrs("invalid").is_err());
+        set_strict_security(before).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["allowed_cidrs"], "fd12:3456::/32");
+        *ALLOWED_CIDRS.write().unwrap() = previous_nets;
         *SECURITY_FILE.write().unwrap() = Some(dir.join("missing/security.json"));
         assert!(set_strict_security(!before).is_err());
         assert_eq!(strict_security(), before);
         *SECURITY_FILE.write().unwrap() = previous;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cidr_list_validates_and_matches_both_families() {
+        let nets = parse_cidrs("fd12:3456::1/32, 10.20.0.1/16").unwrap();
+        assert_eq!(nets[0].to_string(), "fd12:3456::/32");
+        for ip in ["fd12:3456::5", "10.20.1.2", "::ffff:10.20.1.2"] {
+            assert!(matches_cidrs(ip.parse().unwrap(), &nets));
+        }
+        for ip in ["fd12:3457::1", "10.21.0.1", "::1"] {
+            assert!(!matches_cidrs(ip.parse().unwrap(), &nets));
+        }
+        for bad in ["10.0.0.1", "::/129", "10.0.0.0/33", "10.0.0.0/8,", "bad"] {
+            assert!(parse_cidrs(bad).is_err());
+        }
+        assert!(parse_cidrs("").unwrap().is_empty());
     }
 
     #[test]

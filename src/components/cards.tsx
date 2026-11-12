@@ -1,15 +1,15 @@
-import React from "react";
-import { cover, fmt } from "../api";
+import { fmt } from "../api";
 import type { VideoCard } from "../types";
 import { IHeartF, IPlayF } from "../icons";
 import { Img } from "./ui";
+import { CardGrid } from "./CardGrid";
 
 /* ——— 瀑布流卡片 ——— */
 export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void }) {
   const ratio = 1.32;
   return (
     <button onClick={onOpen}
-      className="relative w-full overflow-hidden text-left bg-s1 elev-1 pressable block rounded-(--r-sm)"
+      className="relative min-w-0 w-full overflow-hidden text-left bg-s1 elev-1 pressable block rounded-(--r-sm)"
       style={{ paddingTop: `${ratio * 100}%` }}>
       <Img src={v.cover} />
       <div className="absolute inset-x-0 bottom-0 h-3/5 bg-gradient-to-t from-black/85 via-black/30 to-transparent" />
@@ -30,19 +30,16 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
   );
 }
 
-/* ——— 近无缝瀑布流 ——— */
-export function Masonry({ videos, onOpen, wide = false, gap = "gap-1" }: {
+/* 等比例卡片用网格，避免多栏分片导致 WebKit 中绝对定位封面被裁剪。 */
+export function Masonry({ videos, onOpen, gap = "gap-1" }: {
   videos: VideoCard[]; onOpen: (v: VideoCard) => void; wide?: boolean; gap?: string;
 }) {
-  const mb = gap === "gap-1" ? "mb-1" : "mb-1.5";
   return (
-    <div className={`${wide ? "columns-3 xl:columns-4" : "columns-2"} ${gap} [column-fill:balance]`}>
+    <CardGrid gap={gap === "gap-1" ? 4 : 6}>
       {videos.map((v) => (
-        <div key={v.id} className={`break-inside-avoid ${mb}`}>
-          <WaterfallCard v={v} onOpen={() => onOpen(v)} />
-        </div>
+        <WaterfallCard key={v.id} v={v} onOpen={() => onOpen(v)} />
       ))}
-    </div>
+    </CardGrid>
   );
 }
 

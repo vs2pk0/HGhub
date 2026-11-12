@@ -1,7 +1,7 @@
 {
   "name": "huangguo-client",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
@@ -9,14 +9,17 @@
     "build": "tsc --noEmit && tsc --project tsconfig.tests.json && vite build",
     "preview": "vite preview",
     "test:playback": "node scripts/test-playback.mjs",
+    "test:category-layout": "node scripts/test-category-layout.mjs",
     "test:api-loading": "node scripts/test-api-loading.mjs",
+    "test:security": "node scripts/test-security.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",
     "android:init": "tauri android init",
     "android:icons": "node scripts/sync-android-icons.mjs",
     "android:dev": "tauri android dev",
-    "android:build": "tauri android build"
+    "android:build": "tauri android build",
+    "test:cache": "node scripts/test-playback-cache.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
@@ -37,7 +40,8 @@
     "playwright-core": "1.63.0",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
-    "vite": "7.3.2"
+    "vite": "7.3.2",
+    "esbuild": "0.27.7"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

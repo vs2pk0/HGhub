@@ -1,4 +1,46 @@
 import Foundation
+import Combine
+import Security
+
+protocol SessionTokenStorage {
+    func read(origin: String) -> String
+    func write(_ token: String, origin: String) -> Bool
+    func clear()
+}
+
+final class KeychainTokens: SessionTokenStorage {
+    private let service = (Bundle.main.bundleIdentifier ?? "app.hghub.mobile") + ".session.v2"
+    private func query(_ origin: String? = nil) -> [String: Any] {
+        var value: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service]
+        if let origin { value[kSecAttrAccount as String] = origin }
+        return value
+    }
+    func read(origin: String) -> String {
+        var request = query(origin)
+        request[kSecReturnData as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+    func write(_ token: String, origin: String) -> Bool {
+        let attributes: [String: Any] = [kSecValueData as String: Data(token.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
+        let existing = query(origin)
+        let updated = SecItemUpdate(existing as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else { return false }
+        return SecItemAdd(existing.merging(attributes) { _, new in new } as CFDictionary, nil) == errSecSuccess
+    }
+    func clear() { SecItemDelete(query() as CFDictionary) }
+}
+
+struct SessionContext {
+    let origin: String
+    let token: String
+    let revision: UInt64
+}
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -21,8 +63,19 @@ final class AppModel: ObservableObject {
     /// 全屏播放时收起底栏，避免和小横条抢手势。
     @Published var immersive = false
 
-    let defaults = UserDefaults.standard
+    let defaults: UserDefaults
+    private let tokens: SessionTokenStorage
+    private var sessionOrigin = ""
+    private var sessionRevision: UInt64 = 0
     lazy var api = HgApi(model: self)
+
+    func sessionContext() -> SessionContext {
+        SessionContext(origin: base, token: sessionOrigin == base && trustedLine ? token : "", revision: sessionRevision)
+    }
+
+    func isCurrent(_ context: SessionContext) -> Bool {
+        context.origin == base && context.revision == sessionRevision
+    }
 
     var loggedIn: Bool { !token.isEmpty }
     var trustedLine: Bool { base == "https://huangguoai.com" || base == "https://huangguoai.ai" }
@@ -32,10 +85,13 @@ final class AppModel: ObservableObject {
         ("固定线路 2", "https://huangguoai.ai"),
     ]
 
-    init() {
-        let d = UserDefaults.standard
-        base = d.string(forKey: "hg_base") ?? "https://huangguoai.com"
-        token = d.string(forKey: "hg_token") ?? ""
+    init(defaults: UserDefaults = .standard, tokens: SessionTokenStorage = KeychainTokens()) {
+        self.defaults = defaults
+        self.tokens = tokens
+        let d = defaults
+        let initialBase = d.string(forKey: "hg_base") ?? "https://huangguoai.com"
+        base = initialBase
+        token = tokens.read(origin: initialBase)
         dark = d.bool(forKey: "hg_dark")
         muteOnStartup = d.object(forKey: "hg_mute_startup") == nil ? true : d.bool(forKey: "hg_mute_startup")
         preferHevc = d.bool(forKey: "hg_hevc")
@@ -56,6 +112,16 @@ final class AppModel: ObservableObject {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             account = obj.account()
         }
+        sessionOrigin = d.string(forKey: "hg_token_origin") ?? ""
+        d.removeObject(forKey: "hg_token") // Remove the previous plaintext format.
+        if sessionOrigin != base || !trustedLine || token.isEmpty {
+            token = ""
+            account = nil
+            d.removeObject(forKey: "hg_token")
+            d.removeObject(forKey: "hg_user")
+            d.removeObject(forKey: "hg_token_origin")
+            tokens.clear()
+        }
         if muteOnStartup { muted = true }
     }
 
@@ -68,31 +134,45 @@ final class AppModel: ObservableObject {
     func setPipOnDesktop(_ on: Bool) { pipOnDesktop = on; defaults.set(on, forKey: "hg_pip") }
 
     func setLine(_ url: String) {
-        let next = url.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let next = normalizedOrigin(url.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
         guard next != base else { return }
+        sessionRevision &+= 1
+        sessionOrigin = ""
+        tokens.clear()
         base = next
         token = ""
         account = nil
         defaults.set(next, forKey: "hg_base")
         defaults.removeObject(forKey: "hg_token")
         defaults.removeObject(forKey: "hg_user")
+        defaults.removeObject(forKey: "hg_token_origin")
     }
 
-    func setSession(token: String, user: Account) {
+    func setSession(token: String, user: Account, context: SessionContext) -> Bool {
+        guard isCurrent(context), trustedLine else { return false }
+        guard tokens.write(token, origin: context.origin) else { return false }
+        sessionRevision &+= 1
+        sessionOrigin = context.origin
         self.token = token
         account = user
-        defaults.set(token, forKey: "hg_token")
+        defaults.set(sessionOrigin, forKey: "hg_token_origin")
         let obj: [String: Any] = ["id": user.id, "username": user.username, "nickname": user.nickname, "like": user.like, "collect": user.collect]
         if let data = try? JSONSerialization.data(withJSONObject: obj), let text = String(data: data, encoding: .utf8) {
             defaults.set(text, forKey: "hg_user")
         }
+        return true
     }
 
-    func logout() {
+    func logout(context: SessionContext? = nil) {
+        if let context, !isCurrent(context) { return }
+        sessionRevision &+= 1
+        sessionOrigin = ""
+        tokens.clear()
         token = ""
         account = nil
         defaults.removeObject(forKey: "hg_token")
         defaults.removeObject(forKey: "hg_user")
+        defaults.removeObject(forKey: "hg_token_origin")
     }
 
     func isFav(_ id: Int) -> Bool { favs.contains(id) }

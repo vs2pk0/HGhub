@@ -144,15 +144,37 @@ export function CloseBtn({ onClick }: { onClick: () => void }) {
 export function Img({ src, alt = "", className = "", eager = false, raw = false }: {
   src: string; alt?: string; className?: string; eager?: boolean; raw?: boolean;
 }) {
-  const [ok, setOk] = useState(false);
-  const [err, setErr] = useState(false);
   const url = raw ? src : cover(src);
+  // A new source gets fresh loading/error state; late events cannot affect it.
+  return <ImageSource key={url} url={url} alt={alt} className={className} eager={eager} />;
+}
+
+function ImageSource({ url, alt, className, eager }: {
+  url: string; alt: string; className: string; eager: boolean;
+}) {
+  const host = useRef<HTMLDivElement>(null);
+  const [requested, setRequested] = useState(eager);
+  const [state, setState] = useState<"loading" | "loaded" | "error">("loading");
+  useEffect(() => {
+    if (eager || !("IntersectionObserver" in window)) { setRequested(true); return; }
+    if (requested || !host.current) return;
+    // Observe the stable wrapper, avoiding native lazy-image visibility in fragmented layouts.
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setRequested(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: "600px" });
+    observer.observe(host.current);
+    return () => observer.disconnect();
+  }, [eager, requested]);
   return (
-    <div className={`absolute inset-0 overflow-hidden ${className}`}>
-      {!ok && !err && <div className="absolute inset-0 shimmer" />}
-      {err && <div className="absolute inset-0 bg-s3" />}
-      <img src={url} alt={alt} loading={eager ? "eager" : "lazy"} onLoad={() => setOk(true)} onError={() => setErr(true)}
-        className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${ok ? "opacity-100" : "opacity-0"}`} draggable={false} />
+    <div ref={host} className={`absolute inset-0 overflow-hidden ${className}`}>
+      {state === "loading" && <div className="absolute inset-0 shimmer" />}
+      {state === "error" && <div className="absolute inset-0 bg-s3" />}
+      {requested && url && <img src={url} alt={alt} loading="eager"
+        onLoad={() => setState("loaded")} onError={() => setState("error")}
+        className={`absolute inset-0 w-full h-full object-cover ${state === "loaded" ? "opacity-100" : "opacity-0"}`} draggable={false} />}
     </div>
   );
 }

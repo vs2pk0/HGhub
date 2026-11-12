@@ -13,15 +13,18 @@ concurrency:
   group: native-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   android:
     name: Android signed APK
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -50,6 +53,7 @@ jobs:
             exit 1
           fi
           KS="$RUNNER_TEMP/release.keystore"
+          trap 'rm -f "$KS"' EXIT
           echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
           export HGHUB_KEYSTORE="$KS"
           ZIP="$RUNNER_TEMP/gradle.zip"
@@ -61,7 +65,8 @@ jobs:
           ok=0
           for url in "${urls[@]}"; do
             echo "下载 Gradle: $url"
-            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 180 -o "$ZIP" "$url"; then
+            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 180 -o "$ZIP" "$url" && \
+                echo "f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6  $ZIP" | sha256sum --check --status; then
               ok=1
               break
             fi
@@ -92,7 +97,7 @@ jobs:
           cp "$f" "artifacts/HGhub_${ver}_android.apk"
           ls -lh artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: android
           path: artifacts/*.apk
@@ -103,7 +108,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: 编译未签名 App
         working-directory: native/ios
@@ -137,7 +142,7 @@ jobs:
           cp "build/HGhub_${ver}_ios-unsigned.ipa" "$GITHUB_WORKSPACE/artifacts/"
           ls -lh "$GITHUB_WORKSPACE/artifacts"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ios
           path: artifacts/*.ipa
@@ -150,9 +155,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
