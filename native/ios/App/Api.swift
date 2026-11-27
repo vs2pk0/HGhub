@@ -233,7 +233,7 @@ private func requestScope(_ method: String, _ path: String) throws -> String {
             if pattern.hasPrefix(":") {
                 let name = String(pattern.dropFirst())
                 if name == "id" || name == "cid" || name == "ep" {
-                    return !segment.isEmpty && segment.all(\.isNumber)
+                    return !segment.isEmpty && segment.allSatisfy { $0.isNumber }
                 }
                 return !segment.isEmpty
             }
@@ -255,12 +255,20 @@ private func requestScope(_ method: String, _ path: String) throws -> String {
 private func canonicalPath(_ path: String) -> String {
     guard let q = path.firstIndex(of: "?") else { return path }
     let pathname = String(path[..<q])
-    let pairs = path[path.index(after: q)...].split(separator: "&").filter { !$0.isEmpty }.map { item -> (String, String) in
+    var pairs: [(String, String)] = []
+    for item in path[path.index(after: q)...].split(separator: "&") where !item.isEmpty {
         let parts = item.split(separator: "=", maxSplits: 1).map(String.init)
-        return (parts.first ?? "", parts.dropFirst().first ?? "")
-    }.sorted { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0 }
+        let key = parts.first ?? ""
+        let value = parts.count > 1 ? parts[1] : ""
+        pairs.append((key, value))
+    }
+    pairs.sort { lhs, rhs in
+        if lhs.0 == rhs.0 { return lhs.1 < rhs.1 }
+        return lhs.0 < rhs.0
+    }
     if pairs.isEmpty { return pathname }
-    return pathname + "?" + pairs.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
+    let query = pairs.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
+    return pathname + "?" + query
 }
 
 private struct EdgeRoute {
