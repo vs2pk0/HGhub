@@ -1,10 +1,8 @@
 package app.hghub.mobile.data
 
 import android.util.Base64
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -14,7 +12,6 @@ import java.util.concurrent.TimeUnit
 class ApiException(message: String) : Exception(message)
 
 class HgApi(private val store: AppStore) {
-    private val jsonType = "application/json; charset=utf-8".toMediaType()
     private val http = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -169,26 +166,17 @@ class HgApi(private val store: AppStore) {
         guard(origin)
         if (auth && store.token.isBlank()) throw ApiException("请先登录")
         val encoded = if (body == null) "" else Base64.encodeToString(body.toString().toByteArray(), Base64.NO_WRAP)
-        val envelope = JSONObject()
-            .put("method", method)
-            .put("path", path)
-            .put("body", encoded)
-            .put("content_type", if (body == null) "" else "application/json")
-        val reqBuilder = Request.Builder()
-            .url("$origin/api/edge/request")
-            .header("Accept", "application/json")
-            .header("User-Agent", UA)
-            .header("Referer", "$origin/")
-            .post(envelope.toString().toRequestBody(jsonType))
-        if (auth && store.token.isNotBlank()) {
-            reqBuilder.header("Authorization", "Bearer ${store.token}")
-        }
-        val resp = http.newCall(reqBuilder.build()).execute()
-        val text = resp.body?.string().orEmpty()
-        if (resp.code == 401 || resp.code == 403) throw ApiException("请先登录")
-        if (!resp.isSuccessful) throw ApiException("服务器请求失败（HTTP ${resp.code}），请稍后重试或切换线路")
-        if (text.isBlank()) return JSONObject()
-        val value = runCatching { JSONObject(text) }.getOrElse { throw ApiException("接口返回无法解析") }
+        val value = EdgeChannel.exchange(
+            http,
+            origin,
+            UA,
+            method,
+            path,
+            encoded,
+            if (body == null) "" else "application/json",
+            if (auth) store.token else "",
+        )
+        if (value.length() == 0) return JSONObject()
         if (value.optInt("status", 0) == 1) {
             return value.optJSONObject("data") ?: JSONObject()
         }

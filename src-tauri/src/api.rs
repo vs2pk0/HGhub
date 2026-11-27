@@ -357,9 +357,61 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+    let origin = base();
+    let token = state.session.token(&origin);
+    // 旧的 GET /play 不再返回地址，播放地址在 episodes/playback 的 streams 里。
+    let value = edge(
+        &origin,
+        "POST",
+        &format!("/api/videos/{id}/episodes/{ep}/playback"),
+        Some(json!({})),
+        token.as_deref(),
+    )
+    .await?;
+    Ok(normalize_playback(value))
+}
+
+/// 桌面端仍读取 `video_url`。新接口把地址放在 `streams.main` / `streams.hevc`。
+fn normalize_playback(mut value: Value) -> Value {
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
+    let main = obj
+        .get("streams")
+        .and_then(|streams| streams.get("main"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .to_string();
+    let hevc = obj
+        .get("streams")
+        .and_then(|streams| streams.get("hevc"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .to_string();
+    if obj
+        .get("video_url")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .is_empty()
+        && !main.is_empty()
+    {
+        obj.insert("video_url".into(), json!(main));
+    }
+    if obj
+        .get("video_url_hevc")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .is_empty()
+        && !hevc.is_empty()
+    {
+        obj.insert("video_url_hevc".into(), json!(hevc));
+    }
+    if !obj.contains_key("ep_num") {
+        if let Some(ep) = obj.get("ep").cloned() {
+            obj.insert("ep_num".into(), ep);
+        }
+    }
+    value
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
@@ -461,8 +513,19 @@ pub async fn api_post_comments(
 }
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
-    use serde_json::Value;
+    use super::{is_newer, normalize_playback};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn playback_streams_fill_the_legacy_video_url_fields() {
+        let value = normalize_playback(json!({
+            "ep": 3,
+            "streams": { "main": "https://cdn.example/a.m3u8", "hevc": "https://cdn.example/b.m3u8" }
+        }));
+        assert_eq!(value["video_url"], "https://cdn.example/a.m3u8");
+        assert_eq!(value["video_url_hevc"], "https://cdn.example/b.m3u8");
+        assert_eq!(value["ep_num"], 3);
+    }
 
     #[test]
     fn frontend_cannot_bypass_url_policy_with_opener_commands() {

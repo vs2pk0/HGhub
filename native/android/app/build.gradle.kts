@@ -12,8 +12,8 @@ android {
         applicationId = "app.hghub.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 125
-        versionName = "1.2.5"
+        versionCode = 126
+        versionName = "1.2.6"
     }
 
     val keystorePath = System.getenv("HGHUB_KEYSTORE")

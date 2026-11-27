@@ -1,7 +1,8 @@
 //! 网络层：与上游站点对话。
 //!
-//! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
-//! 我们只实现这一个入口，其余接口都是「填 path」。
+//! 旧的 `POST /api/edge/request` 已停用。业务请求按站点公布的通道分组：
+//! 公开读走 `/api/public/request`，播放、详情和账号走对应的加密通道。
+//! 见 `edge_channel`。
 //!
 //! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
 //!
@@ -161,7 +162,7 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
 
 /// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
 /// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
-async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+pub(crate) async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
@@ -191,6 +192,75 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
         cache.insert(key, (now + CLIENT_TTL, http.clone()));
     }
     Ok((target, http))
+}
+
+pub(crate) struct Posted {
+    pub status: u16,
+    pub headers_ms: u64,
+    pub target_host: String,
+    pub response_kind: &'static str,
+    pub gateway: &'static str,
+    pub extra_header: Option<String>,
+    pub text: String,
+}
+
+/// 向已检查过的 HTTPS 地址发送 JSON。不跟随重定向。
+pub(crate) async fn post_json(
+    url: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+    capture_header: Option<&str>,
+) -> Result<Posted, String> {
+    let started = Instant::now();
+    let (target, client) = client_for(url).await?;
+    let mut req = client
+        .post(target.clone())
+        .header("Accept", "application/json")
+        .json(body);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let resp = req.send().await.map_err(|e| err_text(&e))?;
+    let status = resp.status();
+    if status.is_redirection() {
+        return Err("业务接口重定向已拒绝".into());
+    }
+    let headers_ms = started.elapsed().as_millis() as u64;
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let response_kind = if ctype.contains("json") {
+        "json"
+    } else if ctype.contains("html") {
+        "html"
+    } else {
+        "other"
+    };
+    let gateway = if resp.headers().contains_key("x-amz-cf-id") {
+        "cloudfront"
+    } else if resp.headers().contains_key("cf-ray") {
+        "cloudflare"
+    } else {
+        "other"
+    };
+    let extra_header = capture_header.and_then(|name| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    });
+    let text = resp.text().await.map_err(|e| err_text(&e))?;
+    Ok(Posted {
+        status: status.as_u16(),
+        headers_ms,
+        target_host: target.host_str().unwrap_or("").to_string(),
+        response_kind,
+        gateway,
+        extra_header,
+        text,
+    })
 }
 
 pub fn refresh_client() {
@@ -430,7 +500,9 @@ fn edge_operation(path: &str) -> &'static str {
     let path = path.split('?').next().unwrap_or("");
     if path.starts_with("/api/videos/category/") {
         "category"
-    } else if path.starts_with("/api/videos/") && path.ends_with("/play") {
+    } else if path.starts_with("/api/videos/")
+        && (path.ends_with("/play") || path.ends_with("/playback"))
+    {
         "play"
     } else if path == "/api/videos" {
         "feed"
@@ -490,15 +562,6 @@ pub async fn edge(
         ),
         None => (String::new(), ""),
     };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
-
-    let url = format!("{cur}/api/edge/request");
-    let referer = format!("{cur}/");
     let token = token.map(|s| s.to_string());
 
     static NEXT_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -510,87 +573,40 @@ pub async fn edge(
         .to_string();
     let operation = edge_operation(path);
     let mut attempt = 0;
-    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
     let can_retry = method.eq_ignore_ascii_case("GET") && body.is_none();
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
-        let envelope = envelope.clone();
         let token = token.clone();
-        let url = url.clone();
-        let referer = referer.clone();
+        let encoded = encoded.clone();
+        let cur = cur.clone();
         let line_host = line_host.clone();
         async move {
             let started = Instant::now();
             crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
-            let mut status_code = None;
-            let mut headers_ms = None;
-            let mut target_host = line_host.clone();
-            let mut response_kind = "unknown";
-            let mut gateway = "other";
-            let result = async {
-                let mut next = network_policy::parse_target(&url)?;
-                for hop in 0..=5 {
-                    let (target, client) = client_for(next.as_str()).await?;
-                    target_host = target.host_str().unwrap_or("").to_string();
-                    let mut req = client
-                        .post(target.clone())
-                        .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
-                    if let Some(t) = token.as_deref() {
-                        if !t.is_empty() {
-                            req = req.header("Authorization", format!("Bearer {t}"));
-                        }
-                    }
-                    let resp = req.send().await.map_err(|e| err_text(&e))?;
-                    let status = resp.status();
-                    status_code = Some(status.as_u16());
-                    headers_ms = Some(started.elapsed().as_millis() as u64);
-                    let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-                    response_kind = if ctype.contains("json") { "json" } else if ctype.contains("html") { "html" } else { "other" };
-                    gateway = if resp.headers().contains_key("x-amz-cf-id") { "cloudfront" } else if resp.headers().contains_key("cf-ray") { "cloudflare" } else { "other" };
-                    // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
-                    if status.is_redirection() {
-                        if hop == 5 {
-                            return Err("重定向次数超过限制".into());
-                        }
-                        let location = resp
-                            .headers()
-                            .get(reqwest::header::LOCATION)
-                            .and_then(|h| h.to_str().ok())
-                            .ok_or("重定向缺少有效 Location")?;
-                        next = edge_redirect_target(&target, status.as_u16(), location, guest_get)?;
-                        continue;
-                    }
-                    let text = resp.text().await.map_err(|e| err_text(&e))?;
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        return Err("401".to_string());
-                    }
-                    if !status.is_success() {
-                        return Err(format!(
-                            "HTTP {status}: {}",
-                            text.chars().take(160).collect::<String>()
-                        ));
-                    }
-                    if text.trim().is_empty() {
-                        return Ok(Value::Null);
-                    }
-                    return serde_json::from_str::<Value>(&text)
-                        .map_err(|e| format!("{e}: {}", text.chars().take(160).collect::<String>()));
-                }
-                Err("重定向次数超过限制".into())
-            }.await;
+            let result = crate::edge_channel::exchange(
+                &cur,
+                method,
+                path,
+                &encoded,
+                ctype,
+                token.as_deref(),
+            )
+            .await;
             crate::playback_log::record("api.end", json!({
                 "request": request, "attempt": attempt, "operation": operation, "method": method,
-                "line_host": line_host, "target_host": target_host, "status": status_code,
-                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
-                "response_kind": response_kind, "gateway": gateway,
-                "business_status": result.as_ref().ok().and_then(|v: &Value| v.get("status")).and_then(Value::as_i64),
+                "line_host": line_host,
+                "target_host": result.as_ref().map(|v| v.target_host.as_str()).unwrap_or(""),
+                "status": result.as_ref().ok().map(|v| v.status),
+                "headers_ms": result.as_ref().ok().map(|v| v.headers_ms),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "response_kind": result.as_ref().map(|v| v.response_kind).unwrap_or("unknown"),
+                "gateway": result.as_ref().map(|v| v.gateway).unwrap_or("other"),
+                "business_status": result.as_ref().ok().and_then(|v| v.value.get("status")).and_then(Value::as_i64),
                 "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
                 "retryable": can_retry && result.as_ref().err().is_some_and(|e| retryable_error(e)),
             }));
-            result
+            result.map(|v| v.value)
         }
     })
     .await?;
